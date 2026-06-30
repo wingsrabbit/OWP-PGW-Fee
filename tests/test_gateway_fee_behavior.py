@@ -62,7 +62,9 @@ class GatewayFeeScenario:
         self.invoices = {}
         self.active = {}
         self.audit = []
+        self.client_credit_refunds = {}
         self.next_item_id = 1
+        self.next_transaction_id = 1
         self.lock = Lock()
 
     def add_invoice(self, invoice_id, total, gateway, status="Unpaid", credit="0.00", paid="0.00", client_id=10):
@@ -70,11 +72,14 @@ class GatewayFeeScenario:
             "client_id": client_id,
             "status": status,
             "gateway": gateway,
-            "credit": money(credit),
-            "paid": money(paid),
+            "invoice_credit": money(credit),
+            "applied_credit_transactions": [],
+            "external_transactions": ([{"id": self.next_transaction_id, "amount": money(paid), "gateway": "external", "transid": "seed"}] if money(paid) > money("0.00") else []),
             "items": [{"id": self.next_item_id, "description": "base", "amount": money(total)}],
         }
         self.next_item_id += 1
+        if money(paid) > money("0.00"):
+            self.next_transaction_id += 1
 
     def set_gateway(self, invoice_id, gateway):
         self.invoices[invoice_id]["gateway"] = gateway
@@ -87,13 +92,39 @@ class GatewayFeeScenario:
 
     def balance(self, invoice_id):
         invoice = self.invoices[invoice_id]
-        return max(self.total(invoice_id) - invoice["credit"] - invoice["paid"], money("0.00"))
+        return max(self.total(invoice_id) - self.applied_credit_amount(invoice_id) - self.external_paid_amount(invoice_id), money("0.00"))
 
     def apply_credit(self, invoice_id, amount):
         invoice = self.invoices[invoice_id]
-        invoice["credit"] += money(amount)
+        invoice["applied_credit_transactions"].append({
+            "id": self.next_transaction_id,
+            "amount": money(amount),
+            "gateway": "",
+            "transid": "",
+        })
+        self.next_transaction_id += 1
         if self.balance(invoice_id) <= money("0.00"):
             invoice["status"] = "Paid"
+
+    def apply_external_payment(self, invoice_id, amount, gateway="stripealipay", transid="pi_test"):
+        invoice = self.invoices[invoice_id]
+        invoice["external_transactions"].append({
+            "id": self.next_transaction_id,
+            "amount": money(amount),
+            "gateway": gateway,
+            "transid": transid,
+        })
+        self.next_transaction_id += 1
+        if self.balance(invoice_id) <= money("0.00"):
+            invoice["status"] = "Paid"
+
+    def applied_credit_amount(self, invoice_id):
+        invoice = self.invoices[invoice_id]
+        return money(invoice["invoice_credit"] + sum(transaction["amount"] for transaction in invoice["applied_credit_transactions"]))
+
+    def external_paid_amount(self, invoice_id):
+        invoice = self.invoices[invoice_id]
+        return money(sum(transaction["amount"] for transaction in invoice["external_transactions"]))
 
     def fee_items(self, invoice_id):
         return [
@@ -127,8 +158,8 @@ class GatewayFeeScenario:
         return invoice_items_base_amount(
             invoice["items"],
             exclude_item_id=exclude_item_id,
-            credit=invoice["credit"],
-            paid=invoice["paid"],
+            credit=self.applied_credit_amount(invoice_id),
+            paid=self.external_paid_amount(invoice_id),
         )
 
     def should_remove_fee_for_applied_credit(self, invoice_id, active, base):
@@ -137,9 +168,9 @@ class GatewayFeeScenario:
         invoice = self.invoices[invoice_id]
         if invoice["status"] not in ("Unpaid", "Paid"):
             return False
-        if invoice["credit"] <= money("0.00"):
+        if self.applied_credit_amount(invoice_id) <= money("0.00"):
             return False
-        if invoice["paid"] != money("0.00"):
+        if self.external_paid_amount(invoice_id) != money("0.00"):
             return False
         return base <= money("0.00")
 
@@ -323,15 +354,38 @@ class GatewayFeeScenario:
         active = self.active[invoice_id]
         invoice = self.invoices[invoice_id]
         if cap_credit:
-            invoice["credit"] = cap_credit_to_non_fee_amount(
+            target_credit = cap_credit_to_non_fee_amount(
                 invoice["items"],
                 exclude_item_id=active["invoice_item_id"],
-                credit=invoice["credit"],
-                paid=invoice["paid"],
+                credit=self.applied_credit_amount(invoice_id),
+                paid=self.external_paid_amount(invoice_id),
             )
+            self._cap_applied_credit_sources(invoice_id, target_credit)
         invoice["items"] = [item for item in invoice["items"] if item["id"] != active["invoice_item_id"]]
         active["status"] = "removed"
         del self.active[invoice_id]
+
+    def _cap_applied_credit_sources(self, invoice_id, target_credit):
+        invoice = self.invoices[invoice_id]
+        current_credit = self.applied_credit_amount(invoice_id)
+        if target_credit >= current_credit:
+            return
+
+        target_invoice_credit = min(invoice["invoice_credit"], target_credit)
+        invoice["invoice_credit"] = target_invoice_credit
+        target_transactions = target_credit - target_invoice_credit
+        current_transactions = money(sum(transaction["amount"] for transaction in invoice["applied_credit_transactions"]))
+        reduction = current_transactions - target_transactions
+        if reduction <= money("0.00"):
+            return
+
+        for transaction in reversed(invoice["applied_credit_transactions"]):
+            if reduction <= money("0.00"):
+                break
+            reduce_by = min(transaction["amount"], reduction)
+            transaction["amount"] -= reduce_by
+            reduction -= reduce_by
+            self.client_credit_refunds[invoice["client_id"]] = self.client_credit_refunds.get(invoice["client_id"], money("0.00")) + reduce_by
 
 
 def canary_writer(fee_percent="3.00"):
@@ -442,7 +496,7 @@ def test_cancelled_invoice_with_credit_and_existing_fee_is_not_modified():
     app = production_writer()
     app.add_invoice(41, "100.00", "stripe", status="Unpaid", client_id=10)
     assert app.sync_creation(41) == "added"
-    app.invoices[41]["credit"] = money("103.00")
+    app.apply_credit(41, "103.00")
     app.set_status(41, "Cancelled")
     assert app.sync_published(41) == "skipped"
     assert app.total(41) == money("103.00")
@@ -540,21 +594,37 @@ def test_full_apply_credit_after_fee_removes_fee_before_credit_pays_fee():
     app.apply_credit(84, "100.00")
     assert app.sync_published(84) == "removed"
     assert app.total(84) == money("100.00")
-    assert app.invoices[84]["credit"] == money("100.00")
+    assert app.applied_credit_amount(84) == money("100.00")
     assert app.balance(84) == money("0.00")
     assert len(app.fee_items(84)) == 0
 
 
-def test_over_apply_credit_after_fee_caps_credit_and_removes_paid_credit_fee():
+def test_full_apply_credit_transaction_after_fee_caps_credit_and_removes_paid_credit_fee():
     app = production_writer()
-    app.add_invoice(85, "100.00", "stripe", client_id=10)
+    app = production_writer(fee_percent="3.50")
+    app.add_invoice(85, "10.00", "stripe", client_id=10)
     assert app.sync_creation(85) == "added"
-    app.apply_credit(85, "103.00")
+    assert app.active[85]["fee_amount"] == money("0.35")
+    app.apply_credit(85, "10.35")
     assert app.invoices[85]["status"] == "Paid"
     assert app.sync_published(85) == "removed"
-    assert app.total(85) == money("100.00")
-    assert app.invoices[85]["credit"] == money("100.00")
+    assert app.total(85) == money("10.00")
+    assert app.applied_credit_amount(85) == money("10.00")
+    assert app.client_credit_refunds[10] == money("0.35")
     assert len(app.fee_items(85)) == 0
+
+
+def test_stripealipay_external_payment_is_not_treated_as_credit():
+    app = production_writer(fee_percent="3.50")
+    app.add_invoice(88, "10.00", "stripealipay", client_id=10)
+    assert app.sync_creation(88) == "added"
+    app.apply_external_payment(88, "10.35", gateway="stripealipay", transid="pi_test")
+    assert app.invoices[88]["status"] == "Paid"
+    assert app.sync_published(88) == "skipped"
+    assert len(app.fee_items(88)) == 1
+    assert app.applied_credit_amount(88) == money("0.00")
+    assert app.external_paid_amount(88) == money("10.35")
+    assert app.total(88) == money("10.35")
 
 
 def test_credit_refresh_dry_run_and_kill_switch_do_not_write():
@@ -725,7 +795,8 @@ def run():
         test_available_credit_not_applied_still_charges_fee,
         test_partial_apply_credit_after_fee_refreshes_fee_on_remaining_external_base,
         test_full_apply_credit_after_fee_removes_fee_before_credit_pays_fee,
-        test_over_apply_credit_after_fee_caps_credit_and_removes_paid_credit_fee,
+        test_full_apply_credit_transaction_after_fee_caps_credit_and_removes_paid_credit_fee,
+        test_stripealipay_external_payment_is_not_treated_as_credit,
         test_credit_refresh_dry_run_and_kill_switch_do_not_write,
         test_preautomationtask_after_precronjob_is_not_globally_skipped,
         test_default_config_does_not_write_invoice,

@@ -10,9 +10,10 @@
 - production mode 启用 cron/automation 安全候选扫描：只处理 `Unpaid`，只扫描配置网关 invoice 或本模块已有 active fee 的 invoice，每次最多 500 张。
 
 ### 修复
-- 修复 WHMCS account credit / Apply Credit 口径：仅已 apply 到 invoice 的 credit 会降低 fee base；full credit 不新增 fee，已有 active fee 会移除；partial credit 只按剩余外部 payment gateway 收款金额计算 fee。
-- 修复先选择 Stripe 产生 fee 后再 Apply Credit 的场景：同步时通过 `UpdateInvoice` remove/refresh 本模块 fee，并把 invoice credit cap 到非 fee 金额，避免 account credit 支付手续费。
-- 新增 `InvoicePaidPreEmail` 兜底：credit-only Apply Credit 如果直接把带 fee invoice 标记 Paid，会先尝试移除本模块 fee 再发送 paid email。
+- 修复 WHMCS account credit / ApplyCredit 口径：兼容 WHMCS 9.0.4 production 实测的 `tblaccounts` 空 gateway/transid credit payment transaction，不再只看 `tblinvoices.credit`。
+- 将 invoice payment 拆分为 `applied_credit_amount` 与 `external_paid_amount`，避免把 `stripealipay` 等真实 gateway transaction 误判为 credit-only payment。
+- 修复先选择 Stripe 产生 fee 后再 full ApplyCredit 的场景：同步时通过 `UpdateInvoice` remove 本模块 fee，使用官方 `UpdateTransaction` cap credit transaction，并用 `AddCredit` 退回手续费差额。
+- 新增 `AddTransaction` / `AddInvoicePayment` 入口，尽早覆盖 ApplyCredit / payment transaction flow；保留 `InvoicePaidPreEmail` 作为 paid email 前 fallback。
 - 将已发布 `Unpaid` invoice gateway switch 路径升级为 production mode 自动处理：使用 WHMCS `UpdateInvoice` Local API add/remove 本模块 fee line item；`stripe` / `stripealipay` 之间切换只更新审计 gateway，不重复新增 fee。
 - 保留 fail-closed 默认：`enabled=off`、`mode=canary`、`dry_run_only=on`，默认部署不写 invoice；`emergency_kill_switch=on` 无条件阻断所有 sync、automation 和写入。
 - 修复 production canary P0 安全问题：默认 `enabled=off`，canary mode 不再放行未 allowlist 写入，canary automation 批量扫描保持阻断；只有显式启用、关闭 dry-run、kill switch 关闭且 invoice/client allowlist 精确匹配时才允许写入。

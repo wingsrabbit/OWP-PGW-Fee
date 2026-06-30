@@ -282,6 +282,11 @@ class TermRatGatewayFeeManager
         return self::formatCents(self::amountToCents($left) - self::amountToCents($right));
     }
 
+    public static function addAmounts($left, $right)
+    {
+        return self::formatCents(self::amountToCents($left) + self::amountToCents($right));
+    }
+
     public static function calculateInvoiceItemsBaseAmount($items, $excludeInvoiceItemId = 0, $creditAmount = '0.00', $amountPaid = '0.00')
     {
         $baseCents = self::amountToCents(self::calculateInvoiceItemsGrossAmount($items, $excludeInvoiceItemId));
@@ -465,15 +470,15 @@ class TermRatGatewayFeeManager
         );
     }
 
-    private function removeFee($activeFee, array $snapshot, $reason, $creditAmount = null)
+    private function removeFee($activeFee, array $snapshot, $reason, $targetAppliedCreditAmount = null)
     {
         $invoiceId = (int) $activeFee->invoice_id;
         $invoiceItemId = (int) $activeFee->invoice_item_id;
         $guardDetails = array(
             'invoice_item_id' => $invoiceItemId,
         );
-        if ($creditAmount !== null) {
-            $guardDetails['credit'] = $creditAmount;
+        if ($targetAppliedCreditAmount !== null) {
+            $guardDetails['target_applied_credit_amount'] = $targetAppliedCreditAmount;
         }
 
         $writeGuard = $this->guardInvoiceWrite($snapshot, $reason, 'remove', $guardDetails);
@@ -485,13 +490,15 @@ class TermRatGatewayFeeManager
         if ($invoiceItemId > 0 && $this->invoiceItemExists($invoiceItemId)) {
             $request['deletelineids'] = array($invoiceItemId);
         }
-        if ($creditAmount !== null) {
-            $request['credit'] = $creditAmount;
-        }
 
-        if (isset($request['deletelineids']) || $creditAmount !== null) {
+        if (isset($request['deletelineids'])) {
             $apiResult = $this->callApi('UpdateInvoice', $request);
             $this->assertApiSuccess('UpdateInvoice:remove', $apiResult);
+        }
+
+        $creditAdjustment = null;
+        if ($targetAppliedCreditAmount !== null) {
+            $creditAdjustment = $this->capAppliedCreditSources($snapshot, $targetAppliedCreditAmount, $reason);
         }
 
         Capsule::table(self::TABLE)
@@ -504,14 +511,14 @@ class TermRatGatewayFeeManager
 
         $this->recalculateInvoice($invoiceId);
         $response = array('gateway' => $snapshot['paymentmethod'], 'invoice_item_id' => $invoiceItemId);
-        if ($creditAmount !== null) {
-            $response['credit'] = $creditAmount;
+        if ($creditAdjustment !== null) {
+            $response['credit_adjustment'] = $creditAdjustment;
         }
         $this->log('fee-removed', array('invoice_id' => $invoiceId, 'reason' => $reason), $response, true);
 
         $result = array('action' => 'removed', 'invoice_id' => $invoiceId, 'invoice_item_id' => $invoiceItemId);
-        if ($creditAmount !== null) {
-            $result['credit'] = $creditAmount;
+        if ($creditAdjustment !== null) {
+            $result['credit_adjustment'] = $creditAdjustment;
         }
 
         return $result;
@@ -526,7 +533,7 @@ class TermRatGatewayFeeManager
     {
         $excludeInvoiceItemId = $activeFee ? (int) $activeFee->invoice_item_id : 0;
 
-        return self::calculateInvoiceItemsBaseAmount($snapshot['items'], $excludeInvoiceItemId, $snapshot['credit'], $snapshot['amount_paid']);
+        return self::calculateInvoiceItemsBaseAmount($snapshot['items'], $excludeInvoiceItemId, $snapshot['applied_credit_amount'], $snapshot['external_paid_amount']);
     }
 
     private function inspectPublishedInvoice(array $snapshot, $activeFee, $reason)
@@ -719,15 +726,92 @@ class TermRatGatewayFeeManager
             return false;
         }
 
-        if (self::amountToCents($snapshot['credit']) <= 0) {
+        if (self::amountToCents($snapshot['applied_credit_amount']) <= 0) {
             return false;
         }
 
-        if (self::amountToCents($snapshot['amount_paid']) !== 0) {
+        if (self::amountToCents($snapshot['external_paid_amount']) !== 0) {
             return false;
         }
 
         return self::amountToCents($baseAmount) <= 0;
+    }
+
+    private function capAppliedCreditSources(array $snapshot, $targetAppliedCreditAmount, $reason)
+    {
+        $currentAppliedCreditCents = self::amountToCents($snapshot['applied_credit_amount']);
+        $targetAppliedCreditCents = max(0, self::amountToCents($targetAppliedCreditAmount));
+
+        if ($targetAppliedCreditCents >= $currentAppliedCreditCents) {
+            return null;
+        }
+
+        $transactionCreditCents = 0;
+        foreach ($snapshot['applied_credit_transactions'] as $transaction) {
+            $transactionCreditCents += self::amountToCents($transaction['amount']);
+        }
+
+        $invoiceCreditCents = self::amountToCents($snapshot['invoice_credit_amount']);
+        $targetInvoiceCreditCents = min($invoiceCreditCents, $targetAppliedCreditCents);
+        $reducedInvoiceCreditCents = 0;
+
+        if ($targetInvoiceCreditCents < $invoiceCreditCents) {
+            $apiResult = $this->callApi('UpdateInvoice', array(
+                'invoiceid' => (int) $snapshot['id'],
+                'credit' => self::formatCents($targetInvoiceCreditCents),
+            ));
+            $this->assertApiSuccess('UpdateInvoice:applied-credit-cap', $apiResult);
+            $reducedInvoiceCreditCents = $invoiceCreditCents - $targetInvoiceCreditCents;
+        }
+
+        $targetTransactionCreditCents = max(0, $targetAppliedCreditCents - $targetInvoiceCreditCents);
+        $remainingReductionCents = max(0, $transactionCreditCents - $targetTransactionCreditCents);
+        $reducedTransactionCents = 0;
+        $updatedTransactions = array();
+
+        $transactions = array_reverse($snapshot['applied_credit_transactions']);
+        foreach ($transactions as $transaction) {
+            if ($remainingReductionCents <= 0) {
+                break;
+            }
+
+            $transactionCents = self::amountToCents($transaction['amount']);
+            if ($transactionCents <= 0) {
+                continue;
+            }
+
+            $reduceCents = min($transactionCents, $remainingReductionCents);
+            $newAmount = self::formatCents($transactionCents - $reduceCents);
+            $apiResult = $this->callApi('UpdateTransaction', array(
+                'transactionid' => (int) $transaction['id'],
+                'amountin' => $newAmount,
+            ));
+            $this->assertApiSuccess('UpdateTransaction:applied-credit-cap', $apiResult);
+
+            $remainingReductionCents -= $reduceCents;
+            $reducedTransactionCents += $reduceCents;
+            $updatedTransactions[] = (int) $transaction['id'];
+        }
+
+        if ($reducedTransactionCents > 0) {
+            $refundAmount = self::formatCents($reducedTransactionCents);
+            $apiResult = $this->callApi('AddCredit', array(
+                'clientid' => (int) $snapshot['userid'],
+                'amount' => $refundAmount,
+                'description' => 'Refund gateway fee credit overage for invoice #' . (int) $snapshot['id'],
+            ));
+            $this->assertApiSuccess('AddCredit:applied-credit-overage', $apiResult);
+        }
+
+        $adjustment = array(
+            'target_applied_credit_amount' => self::formatCents($targetAppliedCreditCents),
+            'reduced_invoice_credit_amount' => self::formatCents($reducedInvoiceCreditCents),
+            'reduced_transaction_amount' => self::formatCents($reducedTransactionCents),
+            'updated_transaction_ids' => $updatedTransactions,
+        );
+        $this->log('applied-credit-capped', array('invoice_id' => (int) $snapshot['id'], 'reason' => $reason), $adjustment, true);
+
+        return $adjustment;
     }
 
     private function creditAmountWithoutFeeOverage(array $snapshot, $activeFee)
@@ -739,11 +823,11 @@ class TermRatGatewayFeeManager
         $creditAmount = self::capAppliedCreditToNonFeeAmount(
             $snapshot['items'],
             (int) $activeFee->invoice_item_id,
-            $snapshot['credit'],
-            $snapshot['amount_paid']
+            $snapshot['applied_credit_amount'],
+            $snapshot['external_paid_amount']
         );
 
-        if (self::amountToCents($creditAmount) < self::amountToCents($snapshot['credit'])) {
+        if (self::amountToCents($creditAmount) < self::amountToCents($snapshot['applied_credit_amount'])) {
             return $creditAmount;
         }
 
@@ -895,12 +979,16 @@ class TermRatGatewayFeeManager
             ->orderBy('id', 'asc')
             ->get();
 
-        $transactionTotals = Capsule::connection()->selectOne(
-            'SELECT COALESCE(SUM(amountin), 0) AS amount_in, COALESCE(SUM(amountout), 0) AS amount_out FROM tblaccounts WHERE invoiceid = ?',
-            array((int) $invoiceId)
-        );
-        $amountPaid = self::subtractAmounts($transactionTotals->amount_in, $transactionTotals->amount_out);
-        $balance = self::subtractAmounts(self::subtractAmounts($invoice->total, isset($invoice->credit) ? $invoice->credit : '0.00'), $amountPaid);
+        $transactions = Capsule::table('tblaccounts')
+            ->where('invoiceid', (int) $invoiceId)
+            ->orderBy('id', 'asc')
+            ->get(array('id', 'gateway', 'transid', 'amountin', 'amountout'));
+        $transactionAmounts = $this->classifyTransactionAmounts($transactions);
+        $invoiceCreditAmount = self::formatCents(self::amountToCents(isset($invoice->credit) ? $invoice->credit : '0.00'));
+        $appliedCreditAmount = self::addAmounts($invoiceCreditAmount, $transactionAmounts['applied_credit_amount']);
+        $externalPaidAmount = $transactionAmounts['external_paid_amount'];
+        $amountPaid = self::addAmounts($appliedCreditAmount, $externalPaidAmount);
+        $balance = self::subtractAmounts($invoice->total, $amountPaid);
         if (self::amountToCents($balance) < 0) {
             $balance = '0.00';
         }
@@ -911,9 +999,13 @@ class TermRatGatewayFeeManager
             'status' => (string) $invoice->status,
             'paymentmethod' => strtolower((string) $invoice->paymentmethod),
             'total' => self::formatCents(self::amountToCents($invoice->total)),
-            'credit' => self::formatCents(self::amountToCents(isset($invoice->credit) ? $invoice->credit : '0.00')),
+            'invoice_credit_amount' => $invoiceCreditAmount,
+            'applied_credit_amount' => $appliedCreditAmount,
+            'external_paid_amount' => $externalPaidAmount,
+            'credit' => $appliedCreditAmount,
             'amount_paid' => $amountPaid,
             'balance' => $balance,
+            'applied_credit_transactions' => $transactionAmounts['applied_credit_transactions'],
             'currency_id' => $client && isset($client->currency) ? (int) $client->currency : 0,
             'client_language' => $client && isset($client->language) ? strtolower((string) $client->language) : '',
             'items' => $items,
@@ -987,6 +1079,46 @@ class TermRatGatewayFeeManager
         }
 
         return array_values(array_unique($ids));
+    }
+
+    private function classifyTransactionAmounts($transactions)
+    {
+        $appliedCreditCents = 0;
+        $externalPaidCents = 0;
+        $appliedCreditTransactions = array();
+
+        foreach ($transactions as $transaction) {
+            $netCents = self::amountToCents(self::readValue($transaction, 'amountin', '0.00'));
+            $netCents -= self::amountToCents(self::readValue($transaction, 'amountout', '0.00'));
+
+            if ($netCents <= 0) {
+                continue;
+            }
+
+            if ($this->isAppliedCreditTransaction($transaction)) {
+                $appliedCreditCents += $netCents;
+                $appliedCreditTransactions[] = array(
+                    'id' => (int) self::readValue($transaction, 'id', 0),
+                    'amount' => self::formatCents($netCents),
+                );
+            } else {
+                $externalPaidCents += $netCents;
+            }
+        }
+
+        return array(
+            'applied_credit_amount' => self::formatCents($appliedCreditCents),
+            'external_paid_amount' => self::formatCents($externalPaidCents),
+            'applied_credit_transactions' => $appliedCreditTransactions,
+        );
+    }
+
+    private function isAppliedCreditTransaction($transaction)
+    {
+        $gateway = trim((string) self::readValue($transaction, 'gateway', ''));
+        $transId = trim((string) self::readValue($transaction, 'transid', ''));
+
+        return $gateway === '' && $transId === '';
     }
 
     private function findInvoiceItemAmount($items, $invoiceItemId)

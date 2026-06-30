@@ -29,7 +29,18 @@ function termrat_gateway_fee_hook_sync_invoice($vars, $reason, $creationStage = 
 
 function termrat_gateway_fee_hook_invoice_id($vars)
 {
-    foreach (array('invoiceid', 'invoiceId', 'invoice_id', 'id') as $key) {
+    foreach (array('invoiceid', 'invoiceId', 'invoice_id', 'invocieid', 'id') as $key) {
+        if (isset($vars[$key]) && (int) $vars[$key] > 0) {
+            return (int) $vars[$key];
+        }
+    }
+
+    return 0;
+}
+
+function termrat_gateway_fee_hook_transaction_invoice_id($vars)
+{
+    foreach (array('invoiceid', 'invoiceId', 'invoice_id', 'invocieid') as $key) {
         if (isset($vars[$key]) && (int) $vars[$key] > 0) {
             return (int) $vars[$key];
         }
@@ -170,6 +181,17 @@ add_hook('InvoiceCreated', 1, function ($vars) {
 
 add_hook('InvoiceChangeGateway', 1, function ($vars) {
     termrat_gateway_fee_hook_sync_invoice($vars, 'InvoiceChangeGateway');
+});
+
+add_hook('AddTransaction', 1, function ($vars) {
+    $invoiceId = termrat_gateway_fee_hook_transaction_invoice_id($vars);
+    if ($invoiceId > 0) {
+        termrat_gateway_fee_hook_sync_invoice(array('invoiceid' => $invoiceId), 'AddTransaction');
+    }
+});
+
+add_hook('AddInvoicePayment', 1, function ($vars) {
+    termrat_gateway_fee_hook_sync_invoice($vars, 'AddInvoicePayment');
 });
 
 add_hook('InvoicePaidPreEmail', 1, function ($vars) {

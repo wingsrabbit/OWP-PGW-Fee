@@ -40,7 +40,7 @@
 |------|------|
 | 网关范围 | 默认支持 `stripe`、`stripealipay`，可在 addon 配置中调整 |
 | 费用规则 | `base = invoice 当前应付金额 - 本模块已加 fee`；`fee = round(base * fee_percent / 100, 2)` |
-| WHMCS credit | 只有已经 apply 到 invoice 的 credit 才减少 fee base；仅 client credit balance 可用但未 apply 时仍正常收费 |
+| WHMCS credit | 只有已经 apply 到 invoice 的 credit 才减少 fee base；支持 WHMCS 9.0.4 `ApplyCredit` 写入 `tblaccounts` 空 gateway/transid transaction 的结构；仅 client credit balance 可用但未 apply 时仍正常收费 |
 | 发票状态 | 常规同步只处理 `Unpaid` invoice；`Cancelled` / `Refunded` / `Collections` 不修改；`Paid` 仅允许 credit-only Apply Credit 移除本模块 fee 的修复路径 |
 | Gateway switch | `mailin` / 非 Stripe -> `stripe` / `stripealipay` 自动 add fee；切走自动 remove 本模块 fee；Stripe 类之间切换不重复收费 |
 | 防重复 | 自有审计表 `active_invoice_id` 唯一索引 + invoice 级 MySQL `GET_LOCK` |
@@ -92,15 +92,16 @@ emergency_kill_switch=off
 
 ## 工作机制
 
-1. `InvoiceCreation` 触发时读取 invoice 的 `status`、`paymentmethod`、`credit`、交易入账额和当前 line items。
-2. 创建阶段不依赖尚未最终化的 `tblinvoices.total/balance`，而是从当前 line items 求和，再扣除已有本模块 fee、invoice credit 和已入账金额。
+1. `InvoiceCreation` 触发时读取 invoice 的 `status`、`paymentmethod`、invoice credit 字段、payment transactions 和当前 line items。
+2. 创建阶段不依赖尚未最终化的 `tblinvoices.total/balance`，而是从当前 line items 求和，再扣除已有本模块 fee、已 apply credit 和真实外部 payment gateway 入账金额。
 3. 如果 payment method 命中配置网关，且运行模式允许写入，模块通过 WHMCS `UpdateInvoice` Local API 新增 fee line item。
 4. WHMCS 在 `InvoiceCreation` hook 后重新计算 invoice totals，因此首封 invoice email 和客户看到的 invoice 应包含 fee。
 5. `InvoiceChangeGateway` / invoice view / admin check 对 published `Unpaid` invoice 执行同一同步逻辑：非 Stripe -> Stripe 类 add fee，Stripe 类 -> 非 Stripe remove fee，Stripe 类之间只更新审计 gateway。
 6. Apply Credit 后，fee base 只按仍需外部 payment gateway 收取的非 fee 金额计算；如果 credit 完全覆盖非 fee 金额，模块会移除本模块 fee。
-7. 如果客户先选择 Stripe 产生 fee，再 Apply Credit 到包含 fee 的 invoice，模块会在同步时通过 `UpdateInvoice` 同时 remove fee，并把 invoice credit cap 到非 fee 金额，避免 credit 支付手续费。
-8. `PreCronJob` / `PreAutomationTask` 在 production mode 中执行安全候选扫描，覆盖保存卡/自动扣款前没有人打开 invoice 页面的问题。
-9. 自有表只做审计和幂等控制；如果刷新 fee，旧记录标记为 `removed`，新记录标记为 `active`。
+7. WHMCS 9.0.4 production 实测 `ApplyCredit` 不写 `tblinvoices.credit`，而是在 `tblaccounts` 创建 `gateway=''`、`transid=''`、`amountin=<credit amount>` 的 credit payment transaction。模块把这类 transaction 归类为 `applied_credit_amount`，并把 `gateway=stripealipay`、`transid=pi_...` 等真实 gateway transaction 归类为 `external_paid_amount`。
+8. 如果客户先选择 Stripe 产生 fee，再 Apply Credit 到包含 fee 的 invoice，模块会在同步时通过 `UpdateInvoice` remove/refresh 本模块 fee；如果 full ApplyCredit 已经把手续费也作为 credit transaction 支付，模块会用官方 `UpdateTransaction` cap 该 credit transaction，并用 `AddCredit` 把差额退回客户 credit。
+9. `PreCronJob` / `PreAutomationTask` 在 production mode 中执行安全候选扫描，覆盖保存卡/自动扣款前没有人打开 invoice 页面的问题。
+10. 自有表只做审计和幂等控制；如果刷新 fee，旧记录标记为 `removed`，新记录标记为 `active`。
 
 示例：
 
@@ -110,6 +111,8 @@ emergency_kill_switch=off
 | HK$100.00 invoice 有可用 credit 但未 apply | fee base 仍为 HK$100.00，fee 为 HK$3.00 |
 | HK$100.00 invoice 已 apply HK$40.00 credit | fee base 为 HK$60.00，fee 为 HK$1.80 |
 | HK$100.00 invoice 已 apply HK$100.00 credit | 不新增 fee；如已有本模块 active fee，会移除 fee |
+| HK$10.00 invoice 先产生 HK$0.35 fee，再 ApplyCredit HK$10.35 | 移除 HK$0.35 fee，credit transaction cap 到 HK$10.00，并 AddCredit 退回 HK$0.35 |
+| `stripealipay` 回调 `gateway=stripealipay`、`transid=pi_...`、`amountin=10.30` | 归类为真实外部付款，不触发 credit-only fee removal |
 | published `Unpaid` invoice 从 `mailin` 切到 `stripe` | 自动新增 fee line item |
 | published `Unpaid` invoice 从 `stripealipay` 切到 `mailin` | 自动删除本模块 fee line item，invoice total 回到 base |
 | published `Unpaid` invoice 从 `stripe` 切到 `stripealipay` | 不新增第二条 fee，只更新审计 gateway |
@@ -125,7 +128,9 @@ emergency_kill_switch=off
 | `InvoiceCreation` | 创建阶段同步 fee，目标是让初始 invoice total/email 已包含 fee |
 | `InvoiceCreated` | 创建后补偿同步 |
 | `InvoiceChangeGateway` | published `Unpaid` gateway switch 主路径，自动 add/remove fee |
-| `InvoicePaidPreEmail` | credit-only Apply Credit 直接把带 fee invoice 标记 Paid 时，先尝试移除本模块 fee 再发 paid email |
+| `AddTransaction` | payment/credit transaction 写入后尽早同步，兼容 WHMCS `invocieid` typo key，避免误用 transaction id |
+| `AddInvoicePayment` | payment applied 后同步，覆盖 ApplyCredit / partial payment flow |
+| `InvoicePaidPreEmail` | credit-only Apply Credit 直接把带 fee invoice 标记 Paid 时，作为 paid email 前的 fallback |
 | `ViewInvoiceDetailsPage` | 后台/查看 invoice 时补偿同步 |
 | `ClientAreaPageViewInvoice` | 客户区发票查看入口补偿同步 |
 | `PreCronJob` | production mode 批量同步候选 `Unpaid` invoices |
@@ -323,19 +328,20 @@ Python 行为测试覆盖：
 | 15 | `InvoiceCreation` 阶段 base 扣除 invoice credit / 已入账金额 |
 | 16 | full applied credit 创建阶段不新增 fee |
 | 17 | 仅有可用 credit 但未 apply 时仍正常收费 |
-| 18 | 先有 fee 后 partial Apply Credit，会按剩余外部收款金额刷新 fee |
+| 18 | 先有 fee 后 partial ApplyCredit transaction，会按剩余外部收款金额刷新 fee |
 | 19 | 先有 fee 后 full Apply Credit，会移除 fee，credit 不覆盖手续费 |
-| 20 | Apply Credit 已把含 fee invoice 标记 Paid 时，会 cap credit 并移除 fee |
-| 21 | Apply Credit refresh/remove 仍受 dry-run 和 kill switch 阻断 |
-| 22 | `PreCronJob` 后触发 `PreAutomationTask` 不会被全局 static 无条件跳过 |
-| 23 | 默认 config 下不写入 |
-| 24 | canary mode 仍要求 invoice/client allowlist |
-| 25 | canary mode 只允许精确 invoice/client pair 写入 |
-| 26 | production automation 只扫 `Unpaid` 候选，并且不重复 fee |
-| 27 | automation batch limit 生效 |
-| 28 | canary mode 阻断 automation 批量扫描 |
-| 29 | dry-run 在 canary/production mode 都阻断写入 |
-| 30 | emergency kill switch 在 canary/production mode 都阻断写入和 automation |
+| 20 | ApplyCredit 已把含 fee invoice 标记 Paid 时，会 cap credit transaction、AddCredit 退回差额并移除 fee |
+| 21 | `stripealipay` 真实外部 payment transaction 不会被误判为 credit |
+| 22 | Apply Credit refresh/remove 仍受 dry-run 和 kill switch 阻断 |
+| 23 | `PreCronJob` 后触发 `PreAutomationTask` 不会被全局 static 无条件跳过 |
+| 24 | 默认 config 下不写入 |
+| 25 | canary mode 仍要求 invoice/client allowlist |
+| 26 | canary mode 只允许精确 invoice/client pair 写入 |
+| 27 | production automation 只扫 `Unpaid` 候选，并且不重复 fee |
+| 28 | automation batch limit 生效 |
+| 29 | canary mode 阻断 automation 批量扫描 |
+| 30 | dry-run 在 canary/production mode 都阻断写入 |
+| 31 | emergency kill switch 在 canary/production mode 都阻断写入和 automation |
 
 WHMCS 9.0.4 staging / canary 验收建议：
 
@@ -344,7 +350,7 @@ WHMCS 9.0.4 staging / canary 验收建议：
 3. 同一测试 invoice 从 `mailin` 切到 `stripe`，确认 published `Unpaid` 自动 add fee。
 4. 同一测试 invoice 从 `stripealipay` 切到 `mailin`，确认 published `Unpaid` 自动 remove fee。
 5. 切 `stripe` <-> `stripealipay`，确认不重复收费。
-6. 先选择 `stripe` 产生 fee，再点击 Apply Credit；partial credit 应降低 fee，full credit 应移除 fee，credit 不应覆盖手续费。
+6. 先选择 `stripe` 产生 fee，再调用/点击 ApplyCredit；partial credit 应降低 fee，full credit 应移除 fee，并把 credit transaction cap 到非 fee 金额。
 7. 切到 production mode 前先 `dry_run_only=on` 观察 automation log，再关闭 dry-run。
 
 ---
