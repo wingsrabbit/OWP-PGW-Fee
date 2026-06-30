@@ -325,6 +325,8 @@ TermRat-Gateway-Fee/
 - [WHMCS Invoice Hooks](https://developers.whmcs.com/hooks-reference/invoices-and-quotes/)
 - [WHMCS Cron Hooks](https://developers.whmcs.com/hooks-reference/cron/)
 - [WHMCS UpdateInvoice API](https://developers.whmcs.com/api-reference/updateinvoice/)
+- [WHMCS 9.0 Release Notes: Invoice Immutability](https://docs.whmcs.com/releases/9-0/9-0-release-notes/)
+- [WHMCS 9.0 Invoice Management](https://docs.whmcs.com/9-0/billing-and-invoicing/invoice-management/)
 
 ---
 
