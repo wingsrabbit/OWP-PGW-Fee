@@ -7,7 +7,7 @@ require_once __DIR__ . '/../modules/addons/termrat_gateway_fee/lib/FeeManager.ph
 function tgf_assert_same($expected, $actual, $message)
 {
     if ($expected !== $actual) {
-        fwrite(STDERR, "not ok - {$message}: expected {$expected}, got {$actual}\n");
+        fwrite(STDERR, 'not ok - ' . $message . ': expected ' . json_encode($expected) . ', got ' . json_encode($actual) . "\n");
         exit(1);
     }
 }
@@ -48,5 +48,24 @@ tgf_assert_same(
     ), 0, '20.00', '0.00'),
     'creation-stage base floors credit overpayment at zero'
 );
+
+$defaultConfig = TermRatGatewayFeeManager::normalizeConfig(array());
+tgf_assert_same(false, $defaultConfig['production_canary_enabled'], 'production canary defaults disabled');
+tgf_assert_same(true, $defaultConfig['production_canary_dry_run_only'], 'production canary dry-run-only defaults on');
+tgf_assert_same(array(), $defaultConfig['production_canary_invoice_ids'], 'production canary invoice allowlist defaults empty');
+tgf_assert_same(false, $defaultConfig['emergency_kill_switch'], 'emergency kill switch defaults off');
+
+$canaryConfig = TermRatGatewayFeeManager::normalizeConfig(array(
+    'production_canary_enabled' => 'on',
+    'production_canary_dry_run_only' => '',
+    'production_canary_invoice_ids' => "1001, 1002\n1001",
+    'production_canary_client_ids' => '501; 502',
+    'emergency_kill_switch' => 'yes',
+));
+tgf_assert_same(true, $canaryConfig['production_canary_enabled'], 'production canary can be enabled');
+tgf_assert_same(false, $canaryConfig['production_canary_dry_run_only'], 'production canary dry-run can be explicitly disabled');
+tgf_assert_same(array(1001, 1002), $canaryConfig['production_canary_invoice_ids'], 'production canary invoice allowlist normalizes ids');
+tgf_assert_same(array(501, 502), $canaryConfig['production_canary_client_ids'], 'production canary client allowlist normalizes ids');
+tgf_assert_same(true, $canaryConfig['emergency_kill_switch'], 'emergency kill switch can be enabled');
 
 echo "ok - PHP fee manager math tests passed\n";

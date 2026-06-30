@@ -62,6 +62,38 @@ function termrat_gateway_fee_config()
                 'Description' => 'Write skip/no-op details to the WHMCS module log. Add/remove/error events are always logged.',
                 'Default' => '',
             ),
+            'production_canary_enabled' => array(
+                'FriendlyName' => 'Production Canary Enabled',
+                'Type' => 'yesno',
+                'Description' => 'Enable strict production canary guardrails. When enabled, writes require both invoice and client allowlists.',
+                'Default' => '',
+            ),
+            'production_canary_dry_run_only' => array(
+                'FriendlyName' => 'Production Canary Dry-run Only',
+                'Type' => 'yesno',
+                'Description' => 'Block all canary writes and only log what would have happened. Default on.',
+                'Default' => 'on',
+            ),
+            'production_canary_invoice_ids' => array(
+                'FriendlyName' => 'Production Canary Invoice IDs',
+                'Type' => 'text',
+                'Size' => '48',
+                'Default' => '',
+                'Description' => 'Comma-separated invoice ids allowed for production canary writes. Required when canary is enabled.',
+            ),
+            'production_canary_client_ids' => array(
+                'FriendlyName' => 'Production Canary Client IDs',
+                'Type' => 'text',
+                'Size' => '48',
+                'Default' => '',
+                'Description' => 'Comma-separated client ids allowed for production canary writes. Required when canary is enabled.',
+            ),
+            'emergency_kill_switch' => array(
+                'FriendlyName' => 'Emergency Kill Switch',
+                'Type' => 'yesno',
+                'Description' => 'Immediately block sync, automation, and invoice writes while retaining module log visibility.',
+                'Default' => '',
+            ),
         ),
     );
 }

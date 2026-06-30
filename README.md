@@ -171,6 +171,11 @@ WHMCS addon migration 在 TermRat 当前环境中通常由访问 `Setup -> Addon
 | `fee_description_zh` | `支付网关手续费（{percent}%）` | 中文客户 invoice item 描述 |
 | `taxable` | `off` | 是否将 fee item 标为 taxable |
 | `debug_log` | `off` | 打开后记录 skip/no-op 细节；add/remove/error 始终写 module log |
+| `production_canary_enabled` | `off` | 生产 canary 严格保护开关；开启后写入必须通过 invoice/client allowlist |
+| `production_canary_dry_run_only` | `on` | 生产 canary 默认只记录会发生什么，不执行 invoice 写入 |
+| `production_canary_invoice_ids` | 空 | 允许写入的测试 invoice id 列表；canary 开启时必填 |
+| `production_canary_client_ids` | 空 | 允许写入的测试 client id 列表；canary 开启时必填 |
+| `emergency_kill_switch` | `off` | 紧急停止开关；开启后阻断 sync、automation 和 invoice 写入 |
 
 当前默认支持网关：
 
@@ -253,6 +258,13 @@ PreAutomationTask
 
 自动化检测最多每次扫描 500 张命中条件的 invoice，并检测 500 条 stale active fee。若业务量超过该范围，可在代码中调整 `TermRatGatewayFeeManager::AUTOMATION_LIMIT`，或改成分批任务。
 
+生产 canary 模式下有额外硬限制：
+
+- `production_canary_enabled=on` 时，cron / automation 批量扫描会被直接阻断并记录 module log；
+- invoice 写入必须同时命中 `production_canary_invoice_ids` 和 `production_canary_client_ids`；
+- `production_canary_dry_run_only=on` 时，即使命中 allowlist 也不会调用 `UpdateInvoice`；
+- `emergency_kill_switch=on` 时所有 sync / automation / 写入都会被阻断。
+
 自动扣款前 fee 必须依赖 invoice 创建时的 `InvoiceCreation` 写入。若 invoice 已经发布后才切换到 Stripe 类网关，本模块不会自动加 fee；若已发布后从 Stripe 类网关切走，本模块不会自动删 fee。人工处理建议是作废并重开 invoice，或按业务规则开 credit/debit note，而不是直接改 WHMCS core/DB。
 
 ---
@@ -280,6 +292,12 @@ python3 tests/test_gateway_fee_behavior.py
 | 9 | `InvoiceCreation` 阶段 base 使用 line items，不依赖未最终化 total |
 | 10 | `InvoiceCreation` 阶段 base 扣除 invoice credit / 已入账金额 |
 | 11 | `PreCronJob` 后触发 `PreAutomationTask` 不会被全局 static 无条件跳过 |
+| 12 | canary 默认关闭时不改变非 canary 创建流程 |
+| 13 | canary `dry_run_only` 阻断 allowlisted invoice 写入 |
+| 14 | canary 写入必须同时配置 invoice/client allowlist |
+| 15 | canary 只允许精确命中的 invoice/client 组合写入 |
+| 16 | canary 阻断 cron / automation 批量扫描 |
+| 17 | emergency kill switch 阻断写入和 automation |
 
 如果环境有 PHP CLI，可再跑：
 

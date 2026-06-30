@@ -8,6 +8,7 @@
 - The original requirement for fully automatic fee add/remove after customer gateway switching remains blocked under WHMCS 9.0.4 invoice immutability. This draft PR must not be treated as satisfying that requirement without staging proof of a supported mutation path or an approved automatic reissue / credit-debit-note design.
 
 ### 修复
+- 新增 production canary 安全保护：默认关闭、dry-run-only 默认开启、写入必须命中 invoice/client allowlist、canary 禁止 cron/automation 批量扫描，并提供 emergency kill switch。
 - 修复 automation hook 去重粒度：`PreCronJob` 不再屏蔽后续 `PreAutomationTask`，后者按 task key 去重，未知 task 不去重。
 - 修复 `InvoiceCreation` 阶段使用未最终化 invoice total/balance 的风险；创建阶段改为从当前 invoice line items 计算 base，等待 WHMCS hook 后重算 total。
 - 明确 WHMCS 9.0 immutable invoice 边界：已发布 invoice 的 gateway 切换只检测和记录日志，不自动增删 line item。

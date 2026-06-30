@@ -34,6 +34,11 @@ class TermRatGatewayFeeManager
             'fee_description_zh' => '支付网关手续费（{percent}%）',
             'taxable' => false,
             'debug_log' => false,
+            'production_canary_enabled' => false,
+            'production_canary_dry_run_only' => true,
+            'production_canary_invoice_ids' => array(),
+            'production_canary_client_ids' => array(),
+            'emergency_kill_switch' => false,
         );
     }
 
@@ -45,6 +50,9 @@ class TermRatGatewayFeeManager
         $config['enabled'] = self::toBool($config['enabled']);
         $config['taxable'] = self::toBool($config['taxable']);
         $config['debug_log'] = self::toBool($config['debug_log']);
+        $config['production_canary_enabled'] = self::toBool($config['production_canary_enabled']);
+        $config['production_canary_dry_run_only'] = self::toBool($config['production_canary_dry_run_only']);
+        $config['emergency_kill_switch'] = self::toBool($config['emergency_kill_switch']);
         $config['fee_percent'] = self::normalizePercent($config['fee_percent']);
 
         if (is_array($config['gateways'])) {
@@ -68,6 +76,9 @@ class TermRatGatewayFeeManager
                 $config[$key] = $defaults[$key];
             }
         }
+
+        $config['production_canary_invoice_ids'] = self::normalizeIdList($config['production_canary_invoice_ids']);
+        $config['production_canary_client_ids'] = self::normalizeIdList($config['production_canary_client_ids']);
 
         return $config;
     }
@@ -99,6 +110,11 @@ class TermRatGatewayFeeManager
             'fee_description_zh' => $this->config['fee_description_zh'],
             'taxable' => $this->config['taxable'] ? 'on' : 'off',
             'debug_log' => $this->config['debug_log'] ? 'on' : 'off',
+            'production_canary_enabled' => $this->config['production_canary_enabled'] ? 'on' : 'off',
+            'production_canary_dry_run_only' => $this->config['production_canary_dry_run_only'] ? 'on' : 'off',
+            'production_canary_invoice_ids' => implode(',', $this->config['production_canary_invoice_ids']),
+            'production_canary_client_ids' => implode(',', $this->config['production_canary_client_ids']),
+            'emergency_kill_switch' => $this->config['emergency_kill_switch'] ? 'on' : 'off',
         );
     }
 
@@ -107,6 +123,10 @@ class TermRatGatewayFeeManager
         $invoiceId = (int) $invoiceId;
         if ($invoiceId <= 0) {
             return array('action' => 'skipped', 'message' => 'Invalid invoice id.');
+        }
+
+        if ($this->config['emergency_kill_switch']) {
+            return $this->emergencyKilled($invoiceId, $reason);
         }
 
         return $this->withInvoiceLock($invoiceId, function () use ($invoiceId, $reason) {
@@ -119,6 +139,10 @@ class TermRatGatewayFeeManager
         $invoiceId = (int) $invoiceId;
         if ($invoiceId <= 0) {
             return array('action' => 'skipped', 'message' => 'Invalid invoice id.');
+        }
+
+        if ($this->config['emergency_kill_switch']) {
+            return $this->emergencyKilled($invoiceId, $reason);
         }
 
         return $this->withInvoiceLock($invoiceId, function () use ($invoiceId, $reason) {
@@ -150,6 +174,8 @@ class TermRatGatewayFeeManager
             $action = 'unsupported-immutable-refresh';
         }
 
+        $canaryStatus = $this->canaryWriteStatus($snapshot, 'dry-run', 'inspect');
+
         return array(
             'action' => $action,
             'invoice_id' => $invoiceId,
@@ -158,13 +184,29 @@ class TermRatGatewayFeeManager
             'base_amount' => $baseAmount,
             'fee_percent' => $this->config['fee_percent'],
             'fee_amount' => $feeAmount,
+            'production_canary' => $canaryStatus['enabled'] ? $canaryStatus['message'] : 'disabled',
+            'emergency_kill_switch' => $this->config['emergency_kill_switch'] ? 'on' : 'off',
             'message' => $this->explainApplicability($snapshot),
         );
     }
 
     public function syncAutomationInvoices($reason = 'automation')
     {
-        $stats = array('synced' => 0, 'unsupported' => 0, 'errors' => 0);
+        $stats = array('synced' => 0, 'unsupported' => 0, 'blocked' => 0, 'errors' => 0);
+
+        if ($this->config['emergency_kill_switch']) {
+            $stats['blocked']++;
+            $this->log('emergency-kill-switch', array('reason' => $reason), array('message' => 'Automation skipped because the emergency kill switch is on.'), true);
+
+            return $stats;
+        }
+
+        if ($this->config['production_canary_enabled']) {
+            $stats['blocked']++;
+            $this->log('production-canary-automation-blocked', array('reason' => $reason), array('message' => 'Canary mode forbids cron or automation batch invoice scans.'), true);
+
+            return $stats;
+        }
 
         foreach ($this->findAutomationInvoiceIds() as $invoiceId) {
             try {
@@ -338,6 +380,14 @@ class TermRatGatewayFeeManager
     private function addFee(array $snapshot, $baseAmount, $feeAmount, $reason)
     {
         $invoiceId = (int) $snapshot['id'];
+        $writeGuard = $this->guardInvoiceWrite($snapshot, $reason, 'add', array(
+            'base_amount' => $baseAmount,
+            'fee_amount' => $feeAmount,
+        ));
+        if ($writeGuard !== null) {
+            return $writeGuard;
+        }
+
         $description = $this->getFeeDescription($snapshot);
         $request = array(
             'invoiceid' => $invoiceId,
@@ -385,6 +435,12 @@ class TermRatGatewayFeeManager
     {
         $invoiceId = (int) $activeFee->invoice_id;
         $invoiceItemId = (int) $activeFee->invoice_item_id;
+        $writeGuard = $this->guardInvoiceWrite($snapshot, $reason, 'remove', array(
+            'invoice_item_id' => $invoiceItemId,
+        ));
+        if ($writeGuard !== null) {
+            return $writeGuard;
+        }
 
         if ($invoiceItemId > 0 && $this->invoiceItemExists($invoiceItemId)) {
             $request = array(
@@ -493,6 +549,111 @@ class TermRatGatewayFeeManager
         $this->log($action, array('invoice_id' => (int) $snapshot['id'], 'reason' => $reason), $result, true);
 
         return $result;
+    }
+
+    private function emergencyKilled($invoiceId, $reason)
+    {
+        $result = array(
+            'action' => 'emergency-killed',
+            'invoice_id' => (int) $invoiceId,
+            'message' => 'Emergency kill switch is on; no gateway fee sync was attempted.',
+        );
+
+        $this->log('emergency-kill-switch', array('invoice_id' => (int) $invoiceId, 'reason' => $reason), $result, true);
+
+        return $result;
+    }
+
+    private function guardInvoiceWrite(array $snapshot, $reason, $operation, array $details = array())
+    {
+        if ($this->config['emergency_kill_switch']) {
+            $result = array(
+                'action' => 'emergency-killed',
+                'invoice_id' => (int) $snapshot['id'],
+                'message' => 'Emergency kill switch is on; invoice write was blocked.',
+            );
+            $this->log('emergency-kill-switch', $this->safeWriteLogContext($snapshot, $reason, $operation), $result, true);
+
+            return $result;
+        }
+
+        $status = $this->canaryWriteStatus($snapshot, $reason, $operation);
+        if (!$status['enabled'] || $status['allowed']) {
+            return null;
+        }
+
+        $result = array_merge(array(
+            'action' => $status['action'],
+            'invoice_id' => (int) $snapshot['id'],
+            'client_id' => (int) $snapshot['userid'],
+            'message' => $status['message'],
+        ), $details);
+
+        $this->log('production-canary-write-blocked', $this->safeWriteLogContext($snapshot, $reason, $operation), $result, true);
+
+        return $result;
+    }
+
+    private function canaryWriteStatus(array $snapshot, $reason, $operation)
+    {
+        if (!$this->config['production_canary_enabled']) {
+            return array(
+                'enabled' => false,
+                'allowed' => true,
+                'action' => 'allowed',
+                'message' => 'Production canary is disabled.',
+            );
+        }
+
+        $invoiceId = (int) $snapshot['id'];
+        $clientId = (int) $snapshot['userid'];
+        $invoiceAllowed = in_array($invoiceId, $this->config['production_canary_invoice_ids'], true);
+        $clientAllowed = in_array($clientId, $this->config['production_canary_client_ids'], true);
+
+        if (!$this->config['production_canary_invoice_ids'] || !$this->config['production_canary_client_ids']) {
+            return array(
+                'enabled' => true,
+                'allowed' => false,
+                'action' => 'canary-allowlist-required',
+                'message' => 'Production canary requires both invoice_id and client_id allowlists before any write.',
+            );
+        }
+
+        if (!$invoiceAllowed || !$clientAllowed) {
+            return array(
+                'enabled' => true,
+                'allowed' => false,
+                'action' => 'canary-not-allowlisted',
+                'message' => 'Invoice write blocked because the invoice_id/client_id pair is not allowlisted for production canary.',
+            );
+        }
+
+        if ($this->config['production_canary_dry_run_only']) {
+            return array(
+                'enabled' => true,
+                'allowed' => false,
+                'action' => 'canary-dry-run-only',
+                'message' => 'Production canary dry_run_only is on; invoice write was logged but not executed.',
+            );
+        }
+
+        return array(
+            'enabled' => true,
+            'allowed' => true,
+            'action' => 'canary-write-allowed',
+            'message' => 'Production canary write allowed for the configured invoice_id/client_id pair.',
+        );
+    }
+
+    private function safeWriteLogContext(array $snapshot, $reason, $operation)
+    {
+        return array(
+            'invoice_id' => (int) $snapshot['id'],
+            'client_id' => (int) $snapshot['userid'],
+            'reason' => $reason,
+            'operation' => $operation,
+            'gateway' => $snapshot['paymentmethod'],
+        );
     }
 
     private function activeFeeNeedsRefresh($activeFee, array $snapshot, $baseAmount, $feeAmount)
@@ -635,7 +796,7 @@ class TermRatGatewayFeeManager
     private function findAutomationInvoiceIds()
     {
         $this->assertCapsule();
-        if (!$this->config['enabled']) {
+        if (!$this->config['enabled'] || $this->config['production_canary_enabled'] || $this->config['emergency_kill_switch']) {
             return array();
         }
 
@@ -652,6 +813,10 @@ class TermRatGatewayFeeManager
     private function findStaleActiveFeeInvoiceIds()
     {
         $this->assertCapsule();
+
+        if ($this->config['production_canary_enabled'] || $this->config['emergency_kill_switch']) {
+            return array();
+        }
 
         $query = Capsule::table(self::TABLE . ' as fee')
             ->leftJoin('tblinvoices as inv', 'inv.id', '=', 'fee.invoice_id')
@@ -872,6 +1037,25 @@ class TermRatGatewayFeeManager
         $value = strtolower(trim((string) $value));
 
         return in_array($value, array('1', 'true', 'yes', 'on', 'enabled'), true);
+    }
+
+    private static function normalizeIdList($value)
+    {
+        if (is_array($value)) {
+            $parts = $value;
+        } else {
+            $parts = preg_split('/[\s,;]+/', (string) $value);
+        }
+
+        $ids = array();
+        foreach ($parts as $part) {
+            $id = (int) trim((string) $part);
+            if ($id > 0) {
+                $ids[$id] = true;
+            }
+        }
+
+        return array_keys($ids);
     }
 
     private static function normalizePercent($percent)
