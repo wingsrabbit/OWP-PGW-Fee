@@ -150,10 +150,86 @@ class GatewayFeeScenario:
             active = self.active.get(invoice_id)
             if invoice["status"] != "Unpaid":
                 return "skipped"
-            if invoice["gateway"] not in self.gateways and active:
-                return "unsupported-immutable-remove"
-            if invoice["gateway"] in self.gateways and not active:
-                return "unsupported-immutable-add"
+
+            applicable = invoice["gateway"] in self.gateways
+            if not applicable and not active:
+                return "skipped"
+
+            guard = self.canary_write_status(invoice_id)
+            if not applicable and active:
+                if guard != "allowed":
+                    return guard
+                invoice["items"] = [item for item in invoice["items"] if item["id"] != active["invoice_item_id"]]
+                active["status"] = "removed"
+                del self.active[invoice_id]
+                return "removed"
+
+            if applicable and not active:
+                base = invoice_items_base_amount(invoice["items"], credit=invoice["credit"], paid=invoice["paid"])
+                fee = money(base * self.fee_percent / Decimal("100"))
+                if fee <= money("0.00"):
+                    return "skipped"
+                if guard != "allowed":
+                    return guard
+                item = {
+                    "id": self.next_item_id,
+                    "description": f"Payment gateway processing fee ({self.fee_percent.normalize()}%)",
+                    "amount": fee,
+                }
+                self.next_item_id += 1
+                invoice["items"].append(item)
+                record = {
+                    "invoice_id": invoice_id,
+                    "invoice_item_id": item["id"],
+                    "gateway": invoice["gateway"],
+                    "base_amount": base,
+                    "fee_amount": fee,
+                    "fee_percent": self.fee_percent,
+                    "status": "active",
+                }
+                self.active[invoice_id] = record
+                self.audit.append(record)
+                return "added"
+
+            base = invoice_items_base_amount(
+                invoice["items"],
+                exclude_item_id=active["invoice_item_id"],
+                credit=invoice["credit"],
+                paid=invoice["paid"],
+            )
+            fee = money(base * self.fee_percent / Decimal("100"))
+            if active["base_amount"] != base or active["fee_amount"] != fee or active["fee_percent"] != self.fee_percent:
+                if guard != "allowed":
+                    return guard
+                invoice["items"] = [item for item in invoice["items"] if item["id"] != active["invoice_item_id"]]
+                active["status"] = "removed"
+                del self.active[invoice_id]
+                item = {
+                    "id": self.next_item_id,
+                    "description": f"Payment gateway processing fee ({self.fee_percent.normalize()}%)",
+                    "amount": fee,
+                }
+                self.next_item_id += 1
+                invoice["items"].append(item)
+                record = {
+                    "invoice_id": invoice_id,
+                    "invoice_item_id": item["id"],
+                    "gateway": invoice["gateway"],
+                    "base_amount": base,
+                    "fee_amount": fee,
+                    "fee_percent": self.fee_percent,
+                    "status": "active",
+                }
+                self.active[invoice_id] = record
+                self.audit.append(record)
+                return "refreshed"
+
+            if active["gateway"] != invoice["gateway"]:
+                if guard != "allowed":
+                    return guard
+                active["gateway"] = invoice["gateway"]
+                return "gateway-updated"
+
             return "noop"
 
     def sync_automation(self):
@@ -195,14 +271,36 @@ def test_stripealipay_adds_fee():
     assert app.total(2) == money("103.00")
 
 
-def test_published_gateway_switch_does_not_mutate_immutable_invoice():
+def test_published_unpaid_switch_from_mailin_to_stripe_adds_fee():
+    app = canary_writer()
+    app.add_invoice(3, "100.00", "mailin", client_id=10)
+    assert app.sync_creation(3) == "skipped"
+    app.set_gateway(3, "stripe")
+    assert app.sync_published(3) == "added"
+    assert app.total(3) == money("103.00")
+    assert len(app.fee_items(3)) == 1
+
+
+def test_published_unpaid_switch_from_stripealipay_to_mailin_removes_fee():
+    app = canary_writer()
+    app.add_invoice(3, "100.00", "stripealipay", client_id=10)
+    assert app.sync_creation(3) == "added"
+    app.set_gateway(3, "mailin")
+    assert app.sync_published(3) == "removed"
+    assert app.total(3) == money("100.00")
+    assert len(app.fee_items(3)) == 0
+
+
+def test_published_unpaid_switch_between_stripe_gateways_does_not_duplicate_fee():
     app = canary_writer()
     app.add_invoice(3, "100.00", "stripe", client_id=10)
     assert app.sync_creation(3) == "added"
-    app.set_gateway(3, "banktransfer")
-    assert app.sync_published(3) == "unsupported-immutable-remove"
+    first_item_id = app.fee_items(3)[0]["id"]
+    app.set_gateway(3, "stripealipay")
+    assert app.sync_published(3) == "gateway-updated"
     assert app.total(3) == money("103.00")
     assert len(app.fee_items(3)) == 1
+    assert app.fee_items(3)[0]["id"] == first_item_id
 
 
 def test_paid_invoice_is_not_modified():
@@ -217,6 +315,15 @@ def test_paid_invoice_is_not_modified():
     assert app.sync_published(4) == "skipped"
     assert app.total(4) == money("103.00")
     assert len(app.fee_items(4)) == 1
+
+
+def test_cancelled_invoice_is_not_modified():
+    app = canary_writer()
+    app.add_invoice(40, "100.00", "mailin", status="Cancelled", client_id=10)
+    app.set_gateway(40, "stripe")
+    assert app.sync_published(40) == "skipped"
+    assert app.total(40) == money("100.00")
+    assert len(app.fee_items(40)) == 0
 
 
 def test_base_excludes_existing_fee():
@@ -360,8 +467,11 @@ def run():
         test_stripe_invoice_adds_one_fee,
         test_repeat_sync_does_not_duplicate_fee,
         test_stripealipay_adds_fee,
-        test_published_gateway_switch_does_not_mutate_immutable_invoice,
+        test_published_unpaid_switch_from_mailin_to_stripe_adds_fee,
+        test_published_unpaid_switch_from_stripealipay_to_mailin_removes_fee,
+        test_published_unpaid_switch_between_stripe_gateways_does_not_duplicate_fee,
         test_paid_invoice_is_not_modified,
+        test_cancelled_invoice_is_not_modified,
         test_base_excludes_existing_fee,
         test_concurrent_repeat_sync_does_not_duplicate_active_fee,
         test_fee_percent_is_configurable,

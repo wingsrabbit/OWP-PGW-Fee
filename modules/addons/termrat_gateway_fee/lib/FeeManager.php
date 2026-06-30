@@ -167,14 +167,19 @@ class TermRatGatewayFeeManager
         if (!$this->isInvoiceModifiable($snapshot)) {
             $action = 'skipped';
         } elseif (!$applicable && $activeFee) {
-            $action = 'unsupported-immutable-remove';
+            $action = 'would-remove';
         } elseif ($applicable && !$activeFee && self::amountToCents($feeAmount) > 0) {
-            $action = 'unsupported-immutable-add';
-        } elseif ($applicable && $activeFee && $this->activeFeeNeedsRefresh($activeFee, $snapshot, $baseAmount, $feeAmount)) {
-            $action = 'unsupported-immutable-refresh';
+            $action = 'would-add';
+        } elseif ($applicable && $activeFee && $this->activeFeeNeedsInvoiceRefresh($activeFee, $baseAmount, $feeAmount)) {
+            $action = 'would-refresh';
+        } elseif ($applicable && $activeFee && $this->activeFeeGatewayChanged($activeFee, $snapshot)) {
+            $action = 'would-update-gateway';
         }
 
         $canaryStatus = $this->canaryWriteStatus($snapshot, 'dry-run', 'inspect');
+        if (strpos($action, 'would-') === 0 && !$canaryStatus['allowed']) {
+            $action = $canaryStatus['action'];
+        }
 
         return array(
             'action' => $action,
@@ -472,30 +477,32 @@ class TermRatGatewayFeeManager
         }
 
         if (!$applicable && $activeFee) {
-            return $this->unsupportedPublishedInvoiceMutation(
-                $snapshot,
-                $reason,
-                'unsupported-immutable-remove',
-                'Published invoices are immutable in WHMCS 9.0; gateway fee line item cannot be removed automatically.'
-            );
+            return $this->removeFee($activeFee, $snapshot, $reason . ':published-gateway-remove');
         }
 
         if (!$activeFee && self::amountToCents($feeAmount) > 0) {
-            return $this->unsupportedPublishedInvoiceMutation(
-                $snapshot,
-                $reason,
-                'unsupported-immutable-add',
-                'Published invoices are immutable in WHMCS 9.0; gateway fee line item cannot be added automatically.'
-            );
+            return $this->addFee($snapshot, $baseAmount, $feeAmount, $reason . ':published-gateway-add');
         }
 
-        if ($activeFee && $this->activeFeeNeedsRefresh($activeFee, $snapshot, $baseAmount, $feeAmount)) {
-            return $this->unsupportedPublishedInvoiceMutation(
-                $snapshot,
-                $reason,
-                'unsupported-immutable-refresh',
-                'Published invoices are immutable in WHMCS 9.0; gateway fee line item cannot be refreshed automatically.'
-            );
+        if ($activeFee && $this->activeFeeNeedsInvoiceRefresh($activeFee, $baseAmount, $feeAmount)) {
+            $removeResult = $this->removeFee($activeFee, $snapshot, $reason . ':published-gateway-refresh-remove');
+            if ($removeResult['action'] !== 'removed') {
+                return $removeResult;
+            }
+
+            $snapshot = $this->getInvoiceSnapshot((int) $snapshot['id']);
+            $baseAmount = $this->calculateBaseAmount($snapshot, null);
+            $feeAmount = self::calculateFeeAmount($baseAmount, $this->config['fee_percent']);
+
+            if (self::amountToCents($feeAmount) <= 0) {
+                return array('action' => 'skipped', 'message' => 'Calculated published-stage fee is zero.');
+            }
+
+            return $this->addFee($snapshot, $baseAmount, $feeAmount, $reason . ':published-gateway-refresh-add');
+        }
+
+        if ($activeFee && $this->activeFeeGatewayChanged($activeFee, $snapshot)) {
+            return $this->updateActiveFeeGateway($activeFee, $snapshot, $baseAmount, $feeAmount, $reason . ':published-gateway-update');
         }
 
         return array(
@@ -504,19 +511,6 @@ class TermRatGatewayFeeManager
             'base_amount' => $baseAmount,
             'fee_amount' => $feeAmount,
         );
-    }
-
-    private function unsupportedPublishedInvoiceMutation(array $snapshot, $reason, $action, $message)
-    {
-        $result = array(
-            'action' => $action,
-            'invoice_id' => (int) $snapshot['id'],
-            'message' => $message,
-        );
-
-        $this->log($action, array('invoice_id' => (int) $snapshot['id'], 'reason' => $reason), $result, true);
-
-        return $result;
     }
 
     private function emergencyKilled($invoiceId, $reason)
@@ -635,9 +629,23 @@ class TermRatGatewayFeeManager
 
     private function activeFeeNeedsRefresh($activeFee, array $snapshot, $baseAmount, $feeAmount)
     {
-        if ((string) $activeFee->gateway !== (string) $snapshot['paymentmethod']) {
+        if ($this->activeFeeGatewayChanged($activeFee, $snapshot)) {
             return true;
         }
+        if ($this->activeFeeNeedsInvoiceRefresh($activeFee, $baseAmount, $feeAmount)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private function activeFeeGatewayChanged($activeFee, array $snapshot)
+    {
+        return (string) $activeFee->gateway !== (string) $snapshot['paymentmethod'];
+    }
+
+    private function activeFeeNeedsInvoiceRefresh($activeFee, $baseAmount, $feeAmount)
+    {
         if (self::amountToCents($activeFee->base_amount) !== self::amountToCents($baseAmount)) {
             return true;
         }
@@ -652,6 +660,36 @@ class TermRatGatewayFeeManager
         }
 
         return false;
+    }
+
+    private function updateActiveFeeGateway($activeFee, array $snapshot, $baseAmount, $feeAmount, $reason)
+    {
+        $writeGuard = $this->guardInvoiceWrite($snapshot, $reason, 'metadata-update', array(
+            'invoice_item_id' => (int) $activeFee->invoice_item_id,
+        ));
+        if ($writeGuard !== null) {
+            return $writeGuard;
+        }
+
+        Capsule::table(self::TABLE)
+            ->where('id', (int) $activeFee->id)
+            ->update(array(
+                'gateway' => $snapshot['paymentmethod'],
+                'base_amount' => $baseAmount,
+                'fee_amount' => $feeAmount,
+                'fee_percent' => $this->config['fee_percent'],
+                'updated_at' => $this->now(),
+            ));
+
+        $this->log('fee-gateway-updated', array('invoice_id' => (int) $snapshot['id'], 'reason' => $reason), array('gateway' => $snapshot['paymentmethod'], 'invoice_item_id' => (int) $activeFee->invoice_item_id), true);
+
+        return array(
+            'action' => 'gateway-updated',
+            'invoice_id' => (int) $snapshot['id'],
+            'invoice_item_id' => (int) $activeFee->invoice_item_id,
+            'base_amount' => $baseAmount,
+            'fee_amount' => $feeAmount,
+        );
     }
 
     private function isInvoiceApplicable(array $snapshot)
