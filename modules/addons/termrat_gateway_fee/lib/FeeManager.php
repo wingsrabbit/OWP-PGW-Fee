@@ -27,7 +27,7 @@ class TermRatGatewayFeeManager
     public static function defaults()
     {
         return array(
-            'enabled' => true,
+            'enabled' => false,
             'fee_percent' => '3.00',
             'gateways' => array('stripe', 'stripealipay'),
             'fee_description_en' => 'Payment gateway processing fee ({percent}%)',
@@ -184,7 +184,7 @@ class TermRatGatewayFeeManager
             'base_amount' => $baseAmount,
             'fee_percent' => $this->config['fee_percent'],
             'fee_amount' => $feeAmount,
-            'production_canary' => $canaryStatus['enabled'] ? $canaryStatus['message'] : 'disabled',
+            'production_canary' => $canaryStatus['message'],
             'emergency_kill_switch' => $this->config['emergency_kill_switch'] ? 'on' : 'off',
             'message' => $this->explainApplicability($snapshot),
         );
@@ -201,40 +201,8 @@ class TermRatGatewayFeeManager
             return $stats;
         }
 
-        if ($this->config['production_canary_enabled']) {
-            $stats['blocked']++;
-            $this->log('production-canary-automation-blocked', array('reason' => $reason), array('message' => 'Canary mode forbids cron or automation batch invoice scans.'), true);
-
-            return $stats;
-        }
-
-        foreach ($this->findAutomationInvoiceIds() as $invoiceId) {
-            try {
-                $result = $this->syncInvoice($invoiceId, $reason);
-                if ($result['action'] === 'noop') {
-                    $stats['synced']++;
-                } elseif (strpos($result['action'], 'unsupported') === 0) {
-                    $stats['unsupported']++;
-                }
-            } catch (Exception $e) {
-                $stats['errors']++;
-                $this->log('automation-error', array('invoice_id' => $invoiceId, 'reason' => $reason), array('error' => $e->getMessage()), true);
-            }
-        }
-
-        foreach ($this->findStaleActiveFeeInvoiceIds() as $invoiceId) {
-            try {
-                $result = $this->syncInvoice($invoiceId, $reason . ':cleanup');
-                if (strpos($result['action'], 'unsupported') === 0) {
-                    $stats['unsupported']++;
-                }
-            } catch (Exception $e) {
-                $stats['errors']++;
-                $this->log('automation-cleanup-error', array('invoice_id' => $invoiceId, 'reason' => $reason), array('error' => $e->getMessage()), true);
-            }
-        }
-
-        $this->debug('automation-summary', array('reason' => $reason), $stats);
+        $stats['blocked']++;
+        $this->log('production-canary-automation-blocked', array('reason' => $reason), array('message' => 'Production canary test build forbids cron or automation batch invoice scans.'), true);
 
         return $stats;
     }
@@ -578,7 +546,7 @@ class TermRatGatewayFeeManager
         }
 
         $status = $this->canaryWriteStatus($snapshot, $reason, $operation);
-        if (!$status['enabled'] || $status['allowed']) {
+        if ($status['allowed']) {
             return null;
         }
 
@@ -596,12 +564,21 @@ class TermRatGatewayFeeManager
 
     private function canaryWriteStatus(array $snapshot, $reason, $operation)
     {
+        if (!$this->config['enabled']) {
+            return array(
+                'enabled' => false,
+                'allowed' => false,
+                'action' => 'module-disabled',
+                'message' => 'Module is disabled; invoice writes are blocked.',
+            );
+        }
+
         if (!$this->config['production_canary_enabled']) {
             return array(
                 'enabled' => false,
-                'allowed' => true,
-                'action' => 'allowed',
-                'message' => 'Production canary is disabled.',
+                'allowed' => false,
+                'action' => 'canary-disabled',
+                'message' => 'Production canary is disabled; invoice writes are blocked by default.',
             );
         }
 
@@ -796,43 +773,13 @@ class TermRatGatewayFeeManager
     private function findAutomationInvoiceIds()
     {
         $this->assertCapsule();
-        if (!$this->config['enabled'] || $this->config['production_canary_enabled'] || $this->config['emergency_kill_switch']) {
-            return array();
-        }
-
-        $rows = Capsule::table('tblinvoices')
-            ->where('status', 'Unpaid')
-            ->whereIn('paymentmethod', $this->config['gateways'])
-            ->orderBy('id', 'asc')
-            ->limit(self::AUTOMATION_LIMIT)
-            ->get(array('id'));
-
-        return $this->pluckIds($rows);
+        return array();
     }
 
     private function findStaleActiveFeeInvoiceIds()
     {
         $this->assertCapsule();
-
-        if ($this->config['production_canary_enabled'] || $this->config['emergency_kill_switch']) {
-            return array();
-        }
-
-        $query = Capsule::table(self::TABLE . ' as fee')
-            ->leftJoin('tblinvoices as inv', 'inv.id', '=', 'fee.invoice_id')
-            ->where('fee.status', 'active')
-            ->where('inv.status', 'Unpaid')
-            ->limit(self::AUTOMATION_LIMIT);
-
-        if ($this->config['enabled']) {
-            $query->where(function ($inner) {
-                $inner->whereNotIn('inv.paymentmethod', $this->config['gateways']);
-            });
-        }
-
-        $rows = $query->get(array('fee.invoice_id'));
-
-        return $this->pluckIds($rows, 'invoice_id');
+        return array();
     }
 
     private function pluckIds($rows, $field = 'id')

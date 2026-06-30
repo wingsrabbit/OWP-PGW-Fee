@@ -19,8 +19,8 @@ function termrat_gateway_fee_config()
             'enabled' => array(
                 'FriendlyName' => 'Enabled',
                 'Type' => 'yesno',
-                'Description' => 'Apply and reconcile gateway fee items.',
-                'Default' => 'on',
+                'Description' => 'Enable the production-canary test build. Invoice writes still require canary allowlists and dry-run-only off.',
+                'Default' => '',
             ),
             'fee_percent' => array(
                 'FriendlyName' => 'Fee Percent',

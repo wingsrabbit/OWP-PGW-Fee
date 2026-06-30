@@ -6,6 +6,9 @@
 > **Status: blocked for the original automatic gateway-switch requirement.**
 > WHMCS 9.0 non-Draft invoices are immutable. Under that official boundary, and without editing WHMCS core/gateways or bypassing WHMCS with direct production DB writes, this draft PR does **not** provide a fully automatic way to add/remove fee line items after invoice publication. Do not deploy this PR as a complete solution.
 
+> **Production-canary test build.**
+> This build is fail-closed: default deployment does not write any invoice. Invoice writes require `enabled=on`, `production_canary_enabled=on`, `production_canary_dry_run_only=off`, `emergency_kill_switch=off`, and exact invoice/client allowlist matches.
+
 ![version](https://img.shields.io/badge/version-v0.1.0-blue)
 ![whmcs](https://img.shields.io/badge/WHMCS-9.0.4-2ea44f)
 ![php](https://img.shields.io/badge/PHP-8.3-777bb4)
@@ -43,7 +46,7 @@
 | 发票状态 | 只处理 `Unpaid` invoice；`Paid` / `Cancelled` / `Refunded` / `Collections` 等状态不修改 |
 | 防重复 | 自有审计表 `active_invoice_id` 唯一索引 + invoice 级 MySQL `GET_LOCK` |
 | 明示收费 | fee 作为 `tblinvoiceitems` line item 展示在 WHMCS invoice 内 |
-| WHMCS 9.0 安全边界 | 只在 `InvoiceCreation` 阶段写入 fee；已发布 invoice 的 gateway 切换只检测并写 module log，不自动增删 line item |
+| WHMCS 9.0 安全边界 | 只在 `InvoiceCreation` 阶段且 production-canary guard 全部通过时写入 fee；已发布 invoice 的 gateway 切换只检测并写 module log，不自动增删 line item |
 | 金额精度 | PHP 内部使用 decimal string → integer cents 计算，不使用 float 累加 |
 | 管理后台 | 显示当前配置、最近 50 条 fee 记录，支持 invoice dry-run / immutable-safe check |
 
@@ -53,7 +56,7 @@
 
 1. `InvoiceCreation` 触发时读取 invoice 的 `status`、`paymentmethod`、`credit`、交易入账额和当前 line items。
 2. 如果 payment method 命中配置网关，就按实际应付口径计算 base：当前 line items 小计 - 已有本模块 fee - invoice credit - 已入账金额。
-3. 使用 WHMCS `UpdateInvoice` Local API 在 invoice finalise / deliver 前新增 fee line item。
+3. 只有 production-canary guard 全部通过时，才使用 WHMCS `UpdateInvoice` Local API 在 invoice finalise / deliver 前新增 fee line item。
 4. WHMCS 在 `InvoiceCreation` hook 后重新计算 invoice totals，因此首封 invoice email 和客户看到的 invoice 应包含 fee。
 5. `InvoiceCreated` / `InvoiceChangeGateway` / invoice view / cron automation 阶段不再对已发布 invoice 增删 line item；只检测 missing/mismatch/stale fee 并写 module log。
 6. 自有表只做审计和幂等控制；如果创建阶段刷新 fee，旧记录标记为 `removed`，新记录标记为 `active`。
@@ -62,7 +65,7 @@
 
 | 场景 | 结果 |
 |------|------|
-| 创建 HK$100.00 invoice 且 payment method 是 `stripe` | `InvoiceCreation` 阶段新增 `Payment gateway processing fee (3%)`，金额 HK$3.00，invoice total 变 HK$103.00 |
+| canary guard 全部通过，创建 HK$100.00 invoice 且 payment method 是 `stripe` | `InvoiceCreation` 阶段新增 `Payment gateway processing fee (3%)`，金额 HK$3.00，invoice total 变 HK$103.00 |
 | 创建 HK$100.00 invoice 且已应用 HK$20.00 credit | fee base 为 HK$80.00，fee 为 HK$2.40 |
 | 已发布 invoice 后切换到 `mailin` / `banktransfer` / USDT 类网关 | 不自动删除 fee line item；module log 记录 `unsupported-immutable-remove`，需要人工重开/作废/调整 invoice |
 
@@ -115,9 +118,9 @@ Required next proof before this PR can satisfy the original requirement:
 | `PreCronJob` | cron daily automation 开始前检测命中网关的 `Unpaid` invoices |
 | `PreAutomationTask` | WHMCS automation task 开始前再次检测，并按 task name 去重 |
 
-`InvoiceCreation` 发生在 invoice finalise / deliver 前。这个阶段 `tblinvoices.total` 可能尚未最终化，所以模块不会用 total/balance 计算 base，而是从当前 `tblinvoiceitems` line items 求和，再扣除已有 fee、invoice credit 和已入账金额。WHMCS 会在该 hook 后重新计算 totals，因此初始 invoice email 理论上应包含 fee；上线前仍需在 WHMCS 9.0.4 staging 验证邮件内容。
+`InvoiceCreation` 发生在 invoice finalise / deliver 前。这个阶段 `tblinvoices.total` 可能尚未最终化，所以模块不会用 total/balance 计算 base，而是从当前 `tblinvoiceitems` line items 求和，再扣除已有 fee、invoice credit 和已入账金额。只有 canary guard 全部通过时才会写入；WHMCS 会在该 hook 后重新计算 totals，因此初始 invoice email 理论上应包含 fee；上线前仍需在 WHMCS 9.0.4 staging 或受控 canary 中验证邮件内容。
 
-WHMCS 9.0 系列在 invoice 离开 Draft 后限制直接编辑 invoice line items。因此，除 `InvoiceCreation` 外，本模块不再承诺自动增删已发布 `Unpaid` invoice 的 fee。`PreCronJob` 与 `PreAutomationTask` 只做检测和日志；二者不共享全局“一次性”去重，`PreAutomationTask` 会按 WHMCS 提供的 task name 去重，未知 task name 时不去重，避免被 daily cron 起点的检测挡住。
+WHMCS 9.0 系列在 invoice 离开 Draft 后限制直接编辑 invoice line items。因此，除 `InvoiceCreation` 且 canary guard 全部通过的受控测试外，本模块不再承诺自动增删 invoice fee。`PreCronJob` 与 `PreAutomationTask` 在当前 production-canary test build 中只记录阻断日志，不扫描或批量处理 invoices。
 
 ---
 
@@ -164,7 +167,7 @@ WHMCS addon migration 在 TermRat 当前环境中通常由访问 `Setup -> Addon
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `enabled` | `on` | 总开关。关闭后不再新增 fee；已发布 invoice 上的历史 fee 不会被自动删除 |
+| `enabled` | `off` | production-canary test build 总开关；仅打开此项仍不会写入 invoice |
 | `fee_percent` | `3.00` | 手续费比例，支持小数 |
 | `gateways` | `stripe,stripealipay` | 逗号分隔的 WHMCS gateway system names |
 | `fee_description_en` | `Payment gateway processing fee ({percent}%)` | 英文客户 invoice item 描述 |
@@ -249,23 +252,25 @@ MySQL/MariaDB 允许多个 `NULL`，所以 removed 历史记录可保留多条�
 
 不能只依赖客户打开 invoice 页面触发，因为保存卡自动扣款可能不会打开页面。
 
-本模块在 cron/automation 前检测：
+本模块注册了 cron/automation hook：
 
 ```text
 PreCronJob
 PreAutomationTask
 ```
 
-自动化检测最多每次扫描 500 张命中条件的 invoice，并检测 500 条 stale active fee。若业务量超过该范围，可在代码中调整 `TermRatGatewayFeeManager::AUTOMATION_LIMIT`，或改成分批任务。
+在当前 production-canary test build 中，这些 hook 不会扫描或处理任何 invoice；`syncAutomationInvoices()` 会直接阻断并记录 module log。批量扫描能力必须等后续明确任务重新设计和复审，不能在本版里启用。
 
-生产 canary 模式下有额外硬限制：
+生产 canary test build 有硬限制：
 
-- `production_canary_enabled=on` 时，cron / automation 批量扫描会被直接阻断并记录 module log；
+- 默认部署后不写任何 invoice；
+- `enabled=on` 但 `production_canary_enabled=off` 时仍然阻断写入；
+- `syncAutomationInvoices()` 始终阻断 cron / automation 批量扫描并记录 module log；
 - invoice 写入必须同时命中 `production_canary_invoice_ids` 和 `production_canary_client_ids`；
-- `production_canary_dry_run_only=on` 时，即使命中 allowlist 也不会调用 `UpdateInvoice`；
+- 只有 `enabled=on`、`production_canary_enabled=on`、`production_canary_dry_run_only=off`、`emergency_kill_switch=off`、invoice/client allowlist 精确匹配时才允许调用 `UpdateInvoice`；
 - `emergency_kill_switch=on` 时所有 sync / automation / 写入都会被阻断。
 
-自动扣款前 fee 必须依赖 invoice 创建时的 `InvoiceCreation` 写入。若 invoice 已经发布后才切换到 Stripe 类网关，本模块不会自动加 fee；若已发布后从 Stripe 类网关切走，本模块不会自动删 fee。人工处理建议是作废并重开 invoice，或按业务规则开 credit/debit note，而不是直接改 WHMCS core/DB。
+自动扣款前 fee 只能在 canary guard 全部通过时依赖 invoice 创建时的 `InvoiceCreation` 写入。若 invoice 已经发布后才切换到 Stripe 类网关，本模块不会自动加 fee；若已发布后从 Stripe 类网关切走，本模块不会自动删 fee。人工处理建议是作废并重开 invoice，或按业务规则开 credit/debit note，而不是直接改 WHMCS core/DB。
 
 ---
 
@@ -292,12 +297,14 @@ python3 tests/test_gateway_fee_behavior.py
 | 9 | `InvoiceCreation` 阶段 base 使用 line items，不依赖未最终化 total |
 | 10 | `InvoiceCreation` 阶段 base 扣除 invoice credit / 已入账金额 |
 | 11 | `PreCronJob` 后触发 `PreAutomationTask` 不会被全局 static 无条件跳过 |
-| 12 | canary 默认关闭时不改变非 canary 创建流程 |
-| 13 | canary `dry_run_only` 阻断 allowlisted invoice 写入 |
-| 14 | canary 写入必须同时配置 invoice/client allowlist |
-| 15 | canary 只允许精确命中的 invoice/client 组合写入 |
-| 16 | canary 阻断 cron / automation 批量扫描 |
-| 17 | emergency kill switch 阻断写入和 automation |
+| 12 | 默认 config 下 `sync_creation` 不写入 |
+| 13 | canary disabled 不写入 |
+| 14 | `enabled=on` 但 canary disabled 不写入 |
+| 15 | canary `dry_run_only` 阻断 allowlisted invoice 写入 |
+| 16 | canary 写入必须同时配置 invoice/client allowlist |
+| 17 | 只有 canary enabled + 精确 allowlist + `dry_run_only=off` 才写入 |
+| 18 | production-canary test build 始终阻断 cron / automation 批量扫描 |
+| 19 | emergency kill switch 任何情况下都阻断 |
 
 如果环境有 PHP CLI，可再跑：
 
@@ -309,7 +316,7 @@ php tests/run_hook_tests.php
 部署到 WHMCS staging 后建议再执行人工验收：
 
 1. 创建 HK$100.00 invoice，创建前 payment method 设为 `stripe`。
-2. 确认 `InvoiceCreation` 后首封 invoice email 与 invoice 页面都包含 fee line item，invoice total 为 HK$103.00。
+2. 显式配置 canary allowlist、关闭 dry-run-only 后，确认 `InvoiceCreation` 后首封 invoice email 与 invoice 页面都包含 fee line item，invoice total 为 HK$103.00。
 3. 对已发布 invoice 再次打开 addon dry-run / check，确认不会新增第二条 fee。
 4. 创建 HK$100.00 且已应用 HK$20.00 credit 的 invoice，确认 fee base 为 HK$80.00，fee 为 HK$2.40。
 5. 已发布后把 payment method 切到 `mailin` 或 `banktransfer`，确认模块不自动删除 line item，并在 module log 记录 immutable unsupported。
