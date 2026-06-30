@@ -143,11 +143,11 @@ class TermRatGatewayFeeManager
         if (!$this->isInvoiceModifiable($snapshot)) {
             $action = 'skipped';
         } elseif (!$applicable && $activeFee) {
-            $action = 'would-remove';
+            $action = 'unsupported-immutable-remove';
         } elseif ($applicable && !$activeFee && self::amountToCents($feeAmount) > 0) {
-            $action = 'would-add';
+            $action = 'unsupported-immutable-add';
         } elseif ($applicable && $activeFee && $this->activeFeeNeedsRefresh($activeFee, $snapshot, $baseAmount, $feeAmount)) {
-            $action = 'would-refresh';
+            $action = 'unsupported-immutable-refresh';
         }
 
         return array(
@@ -164,15 +164,15 @@ class TermRatGatewayFeeManager
 
     public function syncAutomationInvoices($reason = 'automation')
     {
-        $stats = array('synced' => 0, 'removed' => 0, 'errors' => 0);
+        $stats = array('synced' => 0, 'unsupported' => 0, 'errors' => 0);
 
         foreach ($this->findAutomationInvoiceIds() as $invoiceId) {
             try {
                 $result = $this->syncInvoice($invoiceId, $reason);
-                if (in_array($result['action'], array('added', 'refreshed', 'noop'), true)) {
+                if ($result['action'] === 'noop') {
                     $stats['synced']++;
-                } elseif ($result['action'] === 'removed') {
-                    $stats['removed']++;
+                } elseif (strpos($result['action'], 'unsupported') === 0) {
+                    $stats['unsupported']++;
                 }
             } catch (Exception $e) {
                 $stats['errors']++;
@@ -183,8 +183,8 @@ class TermRatGatewayFeeManager
         foreach ($this->findStaleActiveFeeInvoiceIds() as $invoiceId) {
             try {
                 $result = $this->syncInvoice($invoiceId, $reason . ':cleanup');
-                if ($result['action'] === 'removed') {
-                    $stats['removed']++;
+                if (strpos($result['action'], 'unsupported') === 0) {
+                    $stats['unsupported']++;
                 }
             } catch (Exception $e) {
                 $stats['errors']++;
@@ -222,7 +222,7 @@ class TermRatGatewayFeeManager
         return self::formatCents(self::amountToCents($left) - self::amountToCents($right));
     }
 
-    public static function calculateInvoiceItemsBaseAmount($items, $excludeInvoiceItemId = 0)
+    public static function calculateInvoiceItemsBaseAmount($items, $excludeInvoiceItemId = 0, $creditAmount = '0.00', $amountPaid = '0.00')
     {
         $excludeInvoiceItemId = (int) $excludeInvoiceItemId;
         $baseCents = 0;
@@ -235,6 +235,9 @@ class TermRatGatewayFeeManager
 
             $baseCents += self::amountToCents(self::readValue($item, 'amount', '0.00'));
         }
+
+        $baseCents -= self::amountToCents($creditAmount);
+        $baseCents -= self::amountToCents($amountPaid);
 
         return self::formatCents(max(0, $baseCents));
     }
@@ -285,58 +288,8 @@ class TermRatGatewayFeeManager
     {
         $snapshot = $this->getInvoiceSnapshot($invoiceId);
         $activeFee = $this->getActiveFee($invoiceId);
-        $applicable = $this->isInvoiceApplicable($snapshot);
 
-        if (!$this->isInvoiceModifiable($snapshot)) {
-            $this->debug('skip', array('invoice_id' => $invoiceId, 'reason' => $reason), array('message' => $this->explainApplicability($snapshot)));
-
-            return array('action' => 'skipped', 'message' => $this->explainApplicability($snapshot));
-        }
-
-        if (!$applicable) {
-            if ($activeFee) {
-                return $this->removeFee($activeFee, $snapshot, $reason);
-            }
-
-            $this->debug('skip', array('invoice_id' => $invoiceId, 'reason' => $reason), array('message' => $this->explainApplicability($snapshot)));
-
-            return array('action' => 'skipped', 'message' => $this->explainApplicability($snapshot));
-        }
-
-        $baseAmount = $this->calculateBaseAmount($snapshot, $activeFee);
-        $feeAmount = self::calculateFeeAmount($baseAmount, $this->config['fee_percent']);
-
-        if (self::amountToCents($feeAmount) <= 0) {
-            if ($activeFee) {
-                return $this->removeFee($activeFee, $snapshot, $reason . ':zero-fee');
-            }
-
-            return array('action' => 'skipped', 'message' => 'Calculated fee is zero.');
-        }
-
-        if ($activeFee && !$this->activeFeeNeedsRefresh($activeFee, $snapshot, $baseAmount, $feeAmount)) {
-            $this->debug('noop', array('invoice_id' => $invoiceId, 'reason' => $reason), array('base_amount' => $baseAmount, 'fee_amount' => $feeAmount));
-
-            return array(
-                'action' => 'noop',
-                'invoice_id' => $invoiceId,
-                'base_amount' => $baseAmount,
-                'fee_amount' => $feeAmount,
-            );
-        }
-
-        if ($activeFee) {
-            $removeResult = $this->removeFee($activeFee, $snapshot, $reason . ':refresh');
-            if ($removeResult['action'] !== 'removed') {
-                return $removeResult;
-            }
-
-            $snapshot = $this->getInvoiceSnapshot($invoiceId);
-            $baseAmount = $this->calculateBaseAmount($snapshot, null);
-            $feeAmount = self::calculateFeeAmount($baseAmount, $this->config['fee_percent']);
-        }
-
-        return $this->addFee($snapshot, $baseAmount, $feeAmount, $reason);
+        return $this->inspectPublishedInvoice($snapshot, $activeFee, $reason);
     }
 
     private function syncInvoiceCreationLocked($invoiceId, $reason)
@@ -475,7 +428,71 @@ class TermRatGatewayFeeManager
     {
         $excludeInvoiceItemId = $activeFee ? (int) $activeFee->invoice_item_id : 0;
 
-        return self::calculateInvoiceItemsBaseAmount($snapshot['items'], $excludeInvoiceItemId);
+        return self::calculateInvoiceItemsBaseAmount($snapshot['items'], $excludeInvoiceItemId, $snapshot['credit'], $snapshot['amount_paid']);
+    }
+
+    private function inspectPublishedInvoice(array $snapshot, $activeFee, $reason)
+    {
+        if (!$this->isInvoiceModifiable($snapshot)) {
+            $this->debug('skip', array('invoice_id' => $snapshot['id'], 'reason' => $reason), array('message' => $this->explainApplicability($snapshot)));
+
+            return array('action' => 'skipped', 'message' => $this->explainApplicability($snapshot));
+        }
+
+        $applicable = $this->isInvoiceApplicable($snapshot);
+        $baseAmount = $this->calculateBaseAmount($snapshot, $activeFee);
+        $feeAmount = self::calculateFeeAmount($baseAmount, $this->config['fee_percent']);
+
+        if (!$applicable && !$activeFee) {
+            return array('action' => 'skipped', 'message' => $this->explainApplicability($snapshot));
+        }
+
+        if (!$applicable && $activeFee) {
+            return $this->unsupportedPublishedInvoiceMutation(
+                $snapshot,
+                $reason,
+                'unsupported-immutable-remove',
+                'Published invoices are immutable in WHMCS 9.0; gateway fee line item cannot be removed automatically.'
+            );
+        }
+
+        if (!$activeFee && self::amountToCents($feeAmount) > 0) {
+            return $this->unsupportedPublishedInvoiceMutation(
+                $snapshot,
+                $reason,
+                'unsupported-immutable-add',
+                'Published invoices are immutable in WHMCS 9.0; gateway fee line item cannot be added automatically.'
+            );
+        }
+
+        if ($activeFee && $this->activeFeeNeedsRefresh($activeFee, $snapshot, $baseAmount, $feeAmount)) {
+            return $this->unsupportedPublishedInvoiceMutation(
+                $snapshot,
+                $reason,
+                'unsupported-immutable-refresh',
+                'Published invoices are immutable in WHMCS 9.0; gateway fee line item cannot be refreshed automatically.'
+            );
+        }
+
+        return array(
+            'action' => 'noop',
+            'invoice_id' => (int) $snapshot['id'],
+            'base_amount' => $baseAmount,
+            'fee_amount' => $feeAmount,
+        );
+    }
+
+    private function unsupportedPublishedInvoiceMutation(array $snapshot, $reason, $action, $message)
+    {
+        $result = array(
+            'action' => $action,
+            'invoice_id' => (int) $snapshot['id'],
+            'message' => $message,
+        );
+
+        $this->log($action, array('invoice_id' => (int) $snapshot['id'], 'reason' => $reason), $result, true);
+
+        return $result;
     }
 
     private function activeFeeNeedsRefresh($activeFee, array $snapshot, $baseAmount, $feeAmount)

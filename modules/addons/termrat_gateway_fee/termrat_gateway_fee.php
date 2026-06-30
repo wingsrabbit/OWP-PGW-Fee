@@ -98,10 +98,10 @@ function termrat_gateway_fee_output($vars)
                 $result = $manager->dryRunInvoice($invoiceId);
                 $dryRunRows = termrat_gateway_fee_render_result_rows($result);
                 $notice = termrat_gateway_fee_notice('info', 'Dry-run completed for invoice #' . $invoiceId . '.');
-            } elseif ($action === 'resync') {
-                $result = $manager->syncInvoice($invoiceId, 'admin-resync');
+            } elseif ($action === 'resync' || $action === 'check') {
+                $result = $manager->syncInvoice($invoiceId, 'admin-check');
                 $dryRunRows = termrat_gateway_fee_render_result_rows($result);
-                $notice = termrat_gateway_fee_notice('success', 'Resync completed for invoice #' . $invoiceId . '.');
+                $notice = termrat_gateway_fee_notice('success', 'Check completed for invoice #' . $invoiceId . '.');
             }
         } catch (Exception $e) {
             $notice = termrat_gateway_fee_notice('danger', $e->getMessage());

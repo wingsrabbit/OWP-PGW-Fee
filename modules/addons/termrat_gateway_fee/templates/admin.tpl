@@ -31,7 +31,7 @@
         </div>
 
         <div class="panel panel-default">
-            <div class="panel-heading"><strong>Dry-run / Resync Invoice</strong></div>
+            <div class="panel-heading"><strong>Dry-run / Check Invoice</strong></div>
             <div class="panel-body">
                 <form method="post" action="{{modulelink}}">
                     <input type="hidden" name="token" value="{{token}}">
@@ -40,7 +40,7 @@
                         <input class="form-control" id="termrat-gateway-fee-invoice-id" name="invoice_id" type="number" min="1" step="1" required>
                     </div>
                     <button class="btn btn-default" type="submit" name="termrat_gateway_fee_action" value="dry_run">Dry-run</button>
-                    <button class="btn btn-primary" type="submit" name="termrat_gateway_fee_action" value="resync">Resync</button>
+                    <button class="btn btn-primary" type="submit" name="termrat_gateway_fee_action" value="check">Check</button>
                 </form>
                 {{dry_run_rows}}
             </div>

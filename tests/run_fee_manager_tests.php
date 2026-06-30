@@ -34,5 +34,19 @@ tgf_assert_same(
     ), 3),
     'creation-stage base excludes existing fee line item'
 );
+tgf_assert_same(
+    '80.00',
+    TermRatGatewayFeeManager::calculateInvoiceItemsBaseAmount(array(
+        array('id' => 1, 'amount' => '100.00'),
+    ), 0, '20.00', '0.00'),
+    'creation-stage base excludes invoice credit'
+);
+tgf_assert_same(
+    '0.00',
+    TermRatGatewayFeeManager::calculateInvoiceItemsBaseAmount(array(
+        array('id' => 1, 'amount' => '10.00'),
+    ), 0, '20.00', '0.00'),
+    'creation-stage base floors credit overpayment at zero'
+);
 
 echo "ok - PHP fee manager math tests passed\n";
