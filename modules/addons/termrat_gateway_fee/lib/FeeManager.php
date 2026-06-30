@@ -17,7 +17,7 @@ class TermRatGatewayFeeManager
     private $apiRunner;
     private $logger;
 
-    public function __construct(array $config = null, $apiRunner = null, $logger = null)
+    public function __construct(?array $config = null, $apiRunner = null, $logger = null)
     {
         $this->config = $config ? self::normalizeConfig($config) : $this->loadConfigFromDatabase();
         $this->apiRunner = $apiRunner;
@@ -111,6 +111,18 @@ class TermRatGatewayFeeManager
 
         return $this->withInvoiceLock($invoiceId, function () use ($invoiceId, $reason) {
             return $this->syncInvoiceLocked($invoiceId, $reason);
+        });
+    }
+
+    public function syncInvoiceCreation($invoiceId, $reason = 'InvoiceCreation')
+    {
+        $invoiceId = (int) $invoiceId;
+        if ($invoiceId <= 0) {
+            return array('action' => 'skipped', 'message' => 'Invalid invoice id.');
+        }
+
+        return $this->withInvoiceLock($invoiceId, function () use ($invoiceId, $reason) {
+            return $this->syncInvoiceCreationLocked($invoiceId, $reason);
         });
     }
 
@@ -208,6 +220,23 @@ class TermRatGatewayFeeManager
     public static function subtractAmounts($left, $right)
     {
         return self::formatCents(self::amountToCents($left) - self::amountToCents($right));
+    }
+
+    public static function calculateInvoiceItemsBaseAmount($items, $excludeInvoiceItemId = 0)
+    {
+        $excludeInvoiceItemId = (int) $excludeInvoiceItemId;
+        $baseCents = 0;
+
+        foreach ($items as $item) {
+            $itemId = (int) self::readValue($item, 'id', 0);
+            if ($excludeInvoiceItemId > 0 && $itemId === $excludeInvoiceItemId) {
+                continue;
+            }
+
+            $baseCents += self::amountToCents(self::readValue($item, 'amount', '0.00'));
+        }
+
+        return self::formatCents(max(0, $baseCents));
     }
 
     public static function amountToCents($amount)
@@ -310,6 +339,49 @@ class TermRatGatewayFeeManager
         return $this->addFee($snapshot, $baseAmount, $feeAmount, $reason);
     }
 
+    private function syncInvoiceCreationLocked($invoiceId, $reason)
+    {
+        $snapshot = $this->getInvoiceSnapshot($invoiceId);
+        $activeFee = $this->getActiveFee($invoiceId);
+
+        if (!$this->isInvoiceCreationApplicable($snapshot)) {
+            $this->debug('creation-skip', array('invoice_id' => $invoiceId, 'reason' => $reason), array('message' => $this->explainCreationApplicability($snapshot)));
+
+            return array('action' => 'skipped', 'message' => $this->explainCreationApplicability($snapshot));
+        }
+
+        $baseAmount = $this->calculateBaseAmountFromItems($snapshot, $activeFee);
+        $feeAmount = self::calculateFeeAmount($baseAmount, $this->config['fee_percent']);
+
+        if (self::amountToCents($feeAmount) <= 0) {
+            return array('action' => 'skipped', 'message' => 'Calculated creation-stage fee is zero.');
+        }
+
+        if ($activeFee && !$this->activeFeeNeedsRefresh($activeFee, $snapshot, $baseAmount, $feeAmount)) {
+            $this->debug('creation-noop', array('invoice_id' => $invoiceId, 'reason' => $reason), array('base_amount' => $baseAmount, 'fee_amount' => $feeAmount));
+
+            return array(
+                'action' => 'noop',
+                'invoice_id' => $invoiceId,
+                'base_amount' => $baseAmount,
+                'fee_amount' => $feeAmount,
+            );
+        }
+
+        if ($activeFee) {
+            $removeResult = $this->removeFee($activeFee, $snapshot, $reason . ':refresh');
+            if ($removeResult['action'] !== 'removed') {
+                return $removeResult;
+            }
+
+            $snapshot = $this->getInvoiceSnapshot($invoiceId);
+            $baseAmount = $this->calculateBaseAmountFromItems($snapshot, null);
+            $feeAmount = self::calculateFeeAmount($baseAmount, $this->config['fee_percent']);
+        }
+
+        return $this->addFee($snapshot, $baseAmount, $feeAmount, $reason . ':line-items-base');
+    }
+
     private function addFee(array $snapshot, $baseAmount, $feeAmount, $reason)
     {
         $invoiceId = (int) $snapshot['id'];
@@ -399,6 +471,13 @@ class TermRatGatewayFeeManager
         return self::formatCents(max(0, $baseCents));
     }
 
+    private function calculateBaseAmountFromItems(array $snapshot, $activeFee)
+    {
+        $excludeInvoiceItemId = $activeFee ? (int) $activeFee->invoice_item_id : 0;
+
+        return self::calculateInvoiceItemsBaseAmount($snapshot['items'], $excludeInvoiceItemId);
+    }
+
     private function activeFeeNeedsRefresh($activeFee, array $snapshot, $baseAmount, $feeAmount)
     {
         if ((string) $activeFee->gateway !== (string) $snapshot['paymentmethod']) {
@@ -433,6 +512,19 @@ class TermRatGatewayFeeManager
         return in_array(strtolower((string) $snapshot['paymentmethod']), $this->config['gateways'], true);
     }
 
+    private function isInvoiceCreationApplicable(array $snapshot)
+    {
+        if (!$this->config['enabled']) {
+            return false;
+        }
+
+        if (!in_array(strtolower((string) $snapshot['status']), array('', 'draft', 'unpaid'), true)) {
+            return false;
+        }
+
+        return in_array(strtolower((string) $snapshot['paymentmethod']), $this->config['gateways'], true);
+    }
+
     private function isInvoiceModifiable(array $snapshot)
     {
         return strcasecmp((string) $snapshot['status'], 'Unpaid') === 0;
@@ -453,6 +545,23 @@ class TermRatGatewayFeeManager
         }
 
         return 'Invoice is applicable.';
+    }
+
+    private function explainCreationApplicability(array $snapshot)
+    {
+        if (!$this->config['enabled']) {
+            return 'Module config is disabled.';
+        }
+
+        if (!in_array(strtolower((string) $snapshot['status']), array('', 'draft', 'unpaid'), true)) {
+            return 'Invoice creation status is not Draft or Unpaid.';
+        }
+
+        if (!in_array(strtolower((string) $snapshot['paymentmethod']), $this->config['gateways'], true)) {
+            return 'Invoice gateway is not configured for gateway fee.';
+        }
+
+        return 'Invoice creation is applicable.';
     }
 
     private function getInvoiceSnapshot($invoiceId)
@@ -722,6 +831,19 @@ class TermRatGatewayFeeManager
     private function now()
     {
         return date('Y-m-d H:i:s');
+    }
+
+    private static function readValue($source, $key, $default = null)
+    {
+        if (is_array($source) && array_key_exists($key, $source)) {
+            return $source[$key];
+        }
+
+        if (is_object($source) && isset($source->{$key})) {
+            return $source->{$key};
+        }
+
+        return $default;
     }
 
     private static function toBool($value)

@@ -7,6 +7,24 @@ def money(value):
     return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
+def invoice_items_base_amount(items, exclude_item_id=0):
+    total = Decimal("0.00")
+    for item in items:
+        if exclude_item_id and item["id"] == exclude_item_id:
+            continue
+        total += money(item["amount"])
+    return money(total)
+
+
+def automation_run_key(reason, task_name=""):
+    if reason == "PreCronJob":
+        return "PreCronJob"
+    if reason == "PreAutomationTask":
+        task_key = "".join(ch.lower() if ch.isalnum() or ch in "_.:-" else "-" for ch in task_name).strip("-")
+        return f"PreAutomationTask:{task_key}" if task_key else ""
+    return reason
+
+
 class GatewayFeeScenario:
     def __init__(self, fee_percent="3.00", gateways=None):
         self.fee_percent = Decimal(str(fee_percent))
@@ -169,6 +187,31 @@ def test_fee_percent_is_configurable():
     assert app.active[7]["fee_amount"] == money("2.50")
 
 
+def test_invoice_creation_base_uses_line_items_not_unfinalized_total():
+    items = [
+        {"id": 1, "description": "service", "amount": "70.00"},
+        {"id": 2, "description": "setup", "amount": "30.00"},
+        {"id": 3, "description": "Payment gateway processing fee (3%)", "amount": "3.00"},
+    ]
+    assert invoice_items_base_amount(items) == money("103.00")
+    assert invoice_items_base_amount(items, exclude_item_id=3) == money("100.00")
+
+
+def test_preautomationtask_after_precronjob_is_not_globally_skipped():
+    seen = set()
+    precron = automation_run_key("PreCronJob")
+    capture = automation_run_key("PreAutomationTask", "Credit Card Charges")
+    unknown_task = automation_run_key("PreAutomationTask")
+
+    assert precron == "PreCronJob"
+    assert capture == "PreAutomationTask:credit-card-charges"
+    assert unknown_task == ""
+
+    seen.add(precron)
+    assert capture not in seen
+    assert unknown_task == ""  # empty key means no dedupe, so WHMCS task still runs
+
+
 def run():
     tests = [
         test_stripe_invoice_adds_one_fee,
@@ -179,6 +222,8 @@ def run():
         test_base_excludes_existing_fee,
         test_concurrent_repeat_sync_does_not_duplicate_active_fee,
         test_fee_percent_is_configurable,
+        test_invoice_creation_base_uses_line_items_not_unfinalized_total,
+        test_preautomationtask_after_precronjob_is_not_globally_skipped,
     ]
     for test in tests:
         test()

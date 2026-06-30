@@ -77,7 +77,9 @@
 | `PreCronJob` | cron daily automation 开始前批量同步，避免只靠客户打开 invoice 页面 |
 | `PreAutomationTask` | WHMCS automation task 开始前再做一次进程内兜底同步 |
 
-WHMCS 没有公开的“每张 invoice 自动扣款前”细粒度 hook 可直接绑定本模块，所以当前选择是：`PreCronJob` 批量同步全部命中网关的 `Unpaid` invoices，并用 `PreAutomationTask` 作为 WHMCS 9.0.4 自动化任务前的补充保险。
+`InvoiceCreation` 发生在 invoice finalise / deliver 前。这个阶段 `tblinvoices.total` 可能尚未最终化，所以模块不会用 total/balance 计算 base，而是从当前 `tblinvoiceitems` line items 求和并排除已有 fee。WHMCS 会在该 hook 后重新计算 totals，因此初始 invoice email 理论上应包含 fee；上线前仍需在 WHMCS 9.0.4 staging 验证邮件内容。
+
+WHMCS 没有公开的“每张 invoice 自动扣款前”细粒度 hook 可直接绑定本模块，所以当前选择是：`PreCronJob` 批量同步全部命中网关的 `Unpaid` invoices，并用 `PreAutomationTask` 作为 WHMCS 9.0.4 自动化任务前的补充保险。`PreCronJob` 与 `PreAutomationTask` 不共享全局“一次性”去重；`PreAutomationTask` 会按 WHMCS 提供的 task name 去重，未知 task name 时不去重，避免被 daily cron 起点的同步挡住。
 
 ---
 
@@ -237,11 +239,14 @@ python3 tests/test_gateway_fee_behavior.py
 | 6 | base amount 不包含已有 fee |
 | 7 | 并发/重复触发不会产生两条 active fee |
 | 8 | fee percent 可配置 |
+| 9 | `InvoiceCreation` 阶段 base 使用 line items，不依赖未最终化 total |
+| 10 | `PreCronJob` 后触发 `PreAutomationTask` 不会被全局 static 无条件跳过 |
 
 如果环境有 PHP CLI，可再跑：
 
 ```bash
 php tests/run_fee_manager_tests.php
+php tests/run_hook_tests.php
 ```
 
 部署到 WHMCS staging 后建议再执行人工验收：
@@ -252,6 +257,7 @@ php tests/run_fee_manager_tests.php
 4. 再次 resync，确认没有第二条 fee。
 5. 切换 payment method 到 `mailin` 或 `banktransfer`，确认 fee 被移除、total 回到 `100.00`。
 6. 把 invoice 标记为 `Paid` 后再次 resync，确认不再修改。
+7. 创建一张新 invoice 并触发 `InvoiceCreation`，确认首封 invoice email 与 invoice total 都包含 fee line item。
 
 ---
 

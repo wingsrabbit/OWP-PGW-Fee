@@ -4,6 +4,10 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
 ## [Unreleased]
+### 修复
+- 修复 automation hook 去重粒度：`PreCronJob` 不再屏蔽后续 `PreAutomationTask`，后者按 task key 去重，未知 task 不去重。
+- 修复 `InvoiceCreation` 阶段使用未最终化 invoice total/balance 的风险；创建阶段改为从当前 invoice line items 计算 base，等待 WHMCS hook 后重算 total。
+- 修复 PHP 8.4 nullable 参数 deprecation：`TermRatGatewayFeeManager::__construct(?array $config = null, ...)`。
 
 ## [0.1.0] - 2026-06-30
 ### 新增
