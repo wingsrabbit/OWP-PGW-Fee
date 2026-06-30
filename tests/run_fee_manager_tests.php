@@ -51,24 +51,47 @@ tgf_assert_same(
 
 $defaultConfig = TermRatGatewayFeeManager::normalizeConfig(array());
 tgf_assert_same(false, $defaultConfig['enabled'], 'module defaults disabled');
-tgf_assert_same(false, $defaultConfig['production_canary_enabled'], 'production canary defaults disabled');
-tgf_assert_same(true, $defaultConfig['production_canary_dry_run_only'], 'production canary dry-run-only defaults on');
+tgf_assert_same('canary', $defaultConfig['mode'], 'module defaults to canary mode');
+tgf_assert_same(true, $defaultConfig['dry_run_only'], 'module defaults dry-run-only on');
+tgf_assert_same(true, $defaultConfig['production_canary_dry_run_only'], 'legacy canary dry-run alias mirrors dry-run-only');
 tgf_assert_same(array(), $defaultConfig['production_canary_invoice_ids'], 'production canary invoice allowlist defaults empty');
 tgf_assert_same(false, $defaultConfig['emergency_kill_switch'], 'emergency kill switch defaults off');
 
 $canaryConfig = TermRatGatewayFeeManager::normalizeConfig(array(
     'enabled' => 'on',
-    'production_canary_enabled' => 'on',
-    'production_canary_dry_run_only' => '',
+    'mode' => 'canary',
+    'dry_run_only' => '',
     'production_canary_invoice_ids' => "1001, 1002\n1001",
     'production_canary_client_ids' => '501; 502',
     'emergency_kill_switch' => 'yes',
 ));
 tgf_assert_same(true, $canaryConfig['enabled'], 'module can be explicitly enabled');
-tgf_assert_same(true, $canaryConfig['production_canary_enabled'], 'production canary can be enabled');
-tgf_assert_same(false, $canaryConfig['production_canary_dry_run_only'], 'production canary dry-run can be explicitly disabled');
+tgf_assert_same('canary', $canaryConfig['mode'], 'canary mode is retained');
+tgf_assert_same(false, $canaryConfig['dry_run_only'], 'dry-run can be explicitly disabled');
+tgf_assert_same(false, $canaryConfig['production_canary_dry_run_only'], 'legacy canary dry-run alias follows dry-run-only');
 tgf_assert_same(array(1001, 1002), $canaryConfig['production_canary_invoice_ids'], 'production canary invoice allowlist normalizes ids');
 tgf_assert_same(array(501, 502), $canaryConfig['production_canary_client_ids'], 'production canary client allowlist normalizes ids');
 tgf_assert_same(true, $canaryConfig['emergency_kill_switch'], 'emergency kill switch can be enabled');
+
+$productionConfig = TermRatGatewayFeeManager::normalizeConfig(array(
+    'enabled' => 'on',
+    'mode' => 'production',
+    'dry_run_only' => '',
+));
+tgf_assert_same(true, $productionConfig['enabled'], 'production config can be enabled');
+tgf_assert_same('production', $productionConfig['mode'], 'production mode is retained');
+tgf_assert_same(false, $productionConfig['dry_run_only'], 'production mode can disable dry-run');
+tgf_assert_same(array(), $productionConfig['production_canary_invoice_ids'], 'production mode does not require invoice allowlist config');
+tgf_assert_same(array(), $productionConfig['production_canary_client_ids'], 'production mode does not require client allowlist config');
+
+$legacyDryRunConfig = TermRatGatewayFeeManager::normalizeConfig(array(
+    'production_canary_dry_run_only' => '',
+));
+tgf_assert_same(false, $legacyDryRunConfig['dry_run_only'], 'legacy canary dry-run input maps to dry-run-only when new key is absent');
+
+$invalidModeConfig = TermRatGatewayFeeManager::normalizeConfig(array(
+    'mode' => 'wide-open',
+));
+tgf_assert_same('canary', $invalidModeConfig['mode'], 'invalid mode normalizes to fail-closed canary');
 
 echo "ok - PHP fee manager math tests passed\n";

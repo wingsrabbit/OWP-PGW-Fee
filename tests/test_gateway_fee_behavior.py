@@ -33,20 +33,22 @@ class GatewayFeeScenario:
         fee_percent="3.00",
         gateways=None,
         enabled=False,
-        canary_enabled=False,
-        canary_dry_run_only=True,
+        mode="canary",
+        dry_run_only=True,
         canary_invoice_ids=None,
         canary_client_ids=None,
         emergency_kill_switch=False,
+        automation_limit=500,
     ):
         self.fee_percent = Decimal(str(fee_percent))
         self.gateways = set(gateways or ["stripe", "stripealipay"])
         self.enabled = enabled
-        self.canary_enabled = canary_enabled
-        self.canary_dry_run_only = canary_dry_run_only
+        self.mode = mode
+        self.dry_run_only = dry_run_only
         self.canary_invoice_ids = set(canary_invoice_ids or [])
         self.canary_client_ids = set(canary_client_ids or [])
         self.emergency_kill_switch = emergency_kill_switch
+        self.automation_limit = automation_limit
         self.invoices = {}
         self.active = {}
         self.audit = []
@@ -74,29 +76,37 @@ class GatewayFeeScenario:
         return money(sum(item["amount"] for item in self.invoices[invoice_id]["items"]))
 
     def fee_items(self, invoice_id):
-        return [item for item in self.invoices[invoice_id]["items"] if item["description"].startswith("Payment gateway processing fee")]
+        return [
+            item
+            for item in self.invoices[invoice_id]["items"]
+            if item["description"].startswith("Payment gateway processing fee")
+        ]
 
-    def canary_write_status(self, invoice_id):
+    def write_status(self, invoice_id):
         if self.emergency_kill_switch:
             return "emergency-killed"
         if not self.enabled:
             return "module-disabled"
-        if not self.canary_enabled:
-            return "canary-disabled"
+        if self.dry_run_only:
+            return "dry-run-only"
+        if self.mode == "production":
+            return "allowed"
+        if self.mode != "canary":
+            return "invalid-mode"
+
         invoice = self.invoices[invoice_id]
         if not self.canary_invoice_ids or not self.canary_client_ids:
             return "canary-allowlist-required"
         if invoice_id not in self.canary_invoice_ids or invoice["client_id"] not in self.canary_client_ids:
             return "canary-not-allowlisted"
-        if self.canary_dry_run_only:
-            return "canary-dry-run-only"
         return "allowed"
 
     def sync_creation(self, invoice_id):
         with self.lock:
-            guard = self.canary_write_status(invoice_id)
+            guard = self.write_status(invoice_id)
             if guard in ("emergency-killed", "module-disabled"):
                 return guard
+
             invoice = self.invoices[invoice_id]
             active = self.active.get(invoice_id)
             if invoice["status"] not in ("", "Draft", "Unpaid"):
@@ -117,31 +127,14 @@ class GatewayFeeScenario:
                     return "noop"
                 if guard != "allowed":
                     return guard
-                invoice["items"] = [item for item in invoice["items"] if item["id"] != active["invoice_item_id"]]
-                active["status"] = "removed"
-                del self.active[invoice_id]
+                self._remove_active_fee(invoice_id)
 
             if guard != "allowed":
                 return guard
+            if fee <= money("0.00"):
+                return "skipped"
 
-            item = {
-                "id": self.next_item_id,
-                "description": f"Payment gateway processing fee ({self.fee_percent.normalize()}%)",
-                "amount": fee,
-            }
-            self.next_item_id += 1
-            invoice["items"].append(item)
-            record = {
-                "invoice_id": invoice_id,
-                "invoice_item_id": item["id"],
-                "gateway": invoice["gateway"],
-                "base_amount": base,
-                "fee_amount": fee,
-                "fee_percent": self.fee_percent,
-                "status": "active",
-            }
-            self.active[invoice_id] = record
-            self.audit.append(record)
+            self._add_fee(invoice_id, base, fee)
             return "added"
 
     def sync_published(self, invoice_id):
@@ -155,13 +148,11 @@ class GatewayFeeScenario:
             if not applicable and not active:
                 return "skipped"
 
-            guard = self.canary_write_status(invoice_id)
+            guard = self.write_status(invoice_id)
             if not applicable and active:
                 if guard != "allowed":
                     return guard
-                invoice["items"] = [item for item in invoice["items"] if item["id"] != active["invoice_item_id"]]
-                active["status"] = "removed"
-                del self.active[invoice_id]
+                self._remove_active_fee(invoice_id)
                 return "removed"
 
             if applicable and not active:
@@ -171,24 +162,7 @@ class GatewayFeeScenario:
                     return "skipped"
                 if guard != "allowed":
                     return guard
-                item = {
-                    "id": self.next_item_id,
-                    "description": f"Payment gateway processing fee ({self.fee_percent.normalize()}%)",
-                    "amount": fee,
-                }
-                self.next_item_id += 1
-                invoice["items"].append(item)
-                record = {
-                    "invoice_id": invoice_id,
-                    "invoice_item_id": item["id"],
-                    "gateway": invoice["gateway"],
-                    "base_amount": base,
-                    "fee_amount": fee,
-                    "fee_percent": self.fee_percent,
-                    "status": "active",
-                }
-                self.active[invoice_id] = record
-                self.audit.append(record)
+                self._add_fee(invoice_id, base, fee)
                 return "added"
 
             base = invoice_items_base_amount(
@@ -201,27 +175,10 @@ class GatewayFeeScenario:
             if active["base_amount"] != base or active["fee_amount"] != fee or active["fee_percent"] != self.fee_percent:
                 if guard != "allowed":
                     return guard
-                invoice["items"] = [item for item in invoice["items"] if item["id"] != active["invoice_item_id"]]
-                active["status"] = "removed"
-                del self.active[invoice_id]
-                item = {
-                    "id": self.next_item_id,
-                    "description": f"Payment gateway processing fee ({self.fee_percent.normalize()}%)",
-                    "amount": fee,
-                }
-                self.next_item_id += 1
-                invoice["items"].append(item)
-                record = {
-                    "invoice_id": invoice_id,
-                    "invoice_item_id": item["id"],
-                    "gateway": invoice["gateway"],
-                    "base_amount": base,
-                    "fee_amount": fee,
-                    "fee_percent": self.fee_percent,
-                    "status": "active",
-                }
-                self.active[invoice_id] = record
-                self.audit.append(record)
+                self._remove_active_fee(invoice_id)
+                if fee <= money("0.00"):
+                    return "skipped"
+                self._add_fee(invoice_id, base, fee)
                 return "refreshed"
 
             if active["gateway"] != invoice["gateway"]:
@@ -232,23 +189,130 @@ class GatewayFeeScenario:
 
             return "noop"
 
+    def dry_run_invoice(self, invoice_id):
+        invoice = self.invoices[invoice_id]
+        active = self.active.get(invoice_id)
+        if invoice["status"] != "Unpaid":
+            return "skipped"
+        applicable = invoice["gateway"] in self.gateways
+        if not applicable and active:
+            action = "would-remove"
+        elif applicable and not active:
+            base = invoice_items_base_amount(invoice["items"], credit=invoice["credit"], paid=invoice["paid"])
+            fee = money(base * self.fee_percent / Decimal("100"))
+            action = "would-add" if fee > money("0.00") else "skipped"
+        elif applicable and active:
+            base = invoice_items_base_amount(
+                invoice["items"],
+                exclude_item_id=active["invoice_item_id"],
+                credit=invoice["credit"],
+                paid=invoice["paid"],
+            )
+            fee = money(base * self.fee_percent / Decimal("100"))
+            if active["base_amount"] != base or active["fee_amount"] != fee or active["fee_percent"] != self.fee_percent:
+                action = "would-refresh"
+            elif active["gateway"] != invoice["gateway"]:
+                action = "would-update-gateway"
+            else:
+                action = "noop"
+        else:
+            action = "skipped"
+
+        if action.startswith("would-"):
+            guard = self.write_status(invoice_id)
+            return action if guard == "allowed" else guard
+        return action
+
     def sync_automation(self):
-        return {"blocked": 1, "scanned": 0}
+        stats = {"scanned": 0, "synced": 0, "unsupported": 0, "blocked": 0, "errors": 0}
+        if self.emergency_kill_switch:
+            stats["blocked"] += 1
+            return stats
+        if not self.enabled:
+            stats["blocked"] += 1
+            return stats
+        if self.mode != "production":
+            stats["blocked"] += 1
+            return stats
+
+        candidate_ids = []
+        for invoice_id, invoice in sorted(self.invoices.items()):
+            if invoice["status"] != "Unpaid":
+                continue
+            if invoice["gateway"] in self.gateways or invoice_id in self.active:
+                candidate_ids.append(invoice_id)
+            if len(candidate_ids) >= self.automation_limit:
+                break
+
+        for invoice_id in candidate_ids:
+            stats["scanned"] += 1
+            result = self.dry_run_invoice(invoice_id) if self.dry_run_only else self.sync_published(invoice_id)
+            if result in ("noop", "skipped", "added", "removed", "refreshed", "gateway-updated"):
+                stats["synced"] += 1
+            elif result.startswith("would-") or result in (
+                "dry-run-only",
+                "module-disabled",
+                "canary-allowlist-required",
+                "canary-not-allowlisted",
+                "invalid-mode",
+                "emergency-killed",
+            ):
+                stats["blocked"] += 1
+            else:
+                stats["unsupported"] += 1
+        return stats
+
+    def _add_fee(self, invoice_id, base, fee):
+        invoice = self.invoices[invoice_id]
+        item = {
+            "id": self.next_item_id,
+            "description": f"Payment gateway processing fee ({self.fee_percent.normalize()}%)",
+            "amount": fee,
+        }
+        self.next_item_id += 1
+        invoice["items"].append(item)
+        record = {
+            "invoice_id": invoice_id,
+            "invoice_item_id": item["id"],
+            "gateway": invoice["gateway"],
+            "base_amount": base,
+            "fee_amount": fee,
+            "fee_percent": self.fee_percent,
+            "status": "active",
+        }
+        self.active[invoice_id] = record
+        self.audit.append(record)
+
+    def _remove_active_fee(self, invoice_id):
+        active = self.active[invoice_id]
+        invoice = self.invoices[invoice_id]
+        invoice["items"] = [item for item in invoice["items"] if item["id"] != active["invoice_item_id"]]
+        active["status"] = "removed"
+        del self.active[invoice_id]
 
 
 def canary_writer(fee_percent="3.00"):
     return GatewayFeeScenario(
         fee_percent=fee_percent,
         enabled=True,
-        canary_enabled=True,
-        canary_dry_run_only=False,
-        canary_invoice_ids=list(range(1, 100)),
-        canary_client_ids=list(range(1, 100)),
+        mode="canary",
+        dry_run_only=False,
+        canary_invoice_ids=list(range(1, 1000)),
+        canary_client_ids=list(range(1, 1000)),
+    )
+
+
+def production_writer(fee_percent="3.00"):
+    return GatewayFeeScenario(
+        fee_percent=fee_percent,
+        enabled=True,
+        mode="production",
+        dry_run_only=False,
     )
 
 
 def test_stripe_invoice_adds_one_fee():
-    app = canary_writer()
+    app = production_writer()
     app.add_invoice(1, "100.00", "stripe", client_id=10)
     assert app.sync_creation(1) == "added"
     assert app.total(1) == money("103.00")
@@ -256,7 +320,7 @@ def test_stripe_invoice_adds_one_fee():
 
 
 def test_repeat_sync_does_not_duplicate_fee():
-    app = canary_writer()
+    app = production_writer()
     app.add_invoice(1, "100.00", "stripe", client_id=10)
     assert app.sync_creation(1) == "added"
     assert app.sync_creation(1) == "noop"
@@ -265,14 +329,21 @@ def test_repeat_sync_does_not_duplicate_fee():
 
 
 def test_stripealipay_adds_fee():
-    app = canary_writer()
+    app = production_writer()
     app.add_invoice(2, "100.00", "stripealipay", client_id=10)
     assert app.sync_creation(2) == "added"
     assert app.total(2) == money("103.00")
 
 
-def test_published_unpaid_switch_from_mailin_to_stripe_adds_fee():
-    app = canary_writer()
+def test_production_mode_does_not_require_allowlist():
+    app = production_writer()
+    app.add_invoice(20, "100.00", "stripe", client_id=999)
+    assert app.sync_creation(20) == "added"
+    assert len(app.fee_items(20)) == 1
+
+
+def test_production_published_unpaid_switch_from_mailin_to_stripe_adds_fee():
+    app = production_writer()
     app.add_invoice(3, "100.00", "mailin", client_id=10)
     assert app.sync_creation(3) == "skipped"
     app.set_gateway(3, "stripe")
@@ -281,82 +352,80 @@ def test_published_unpaid_switch_from_mailin_to_stripe_adds_fee():
     assert len(app.fee_items(3)) == 1
 
 
-def test_published_unpaid_switch_from_stripealipay_to_mailin_removes_fee():
-    app = canary_writer()
-    app.add_invoice(3, "100.00", "stripealipay", client_id=10)
-    assert app.sync_creation(3) == "added"
-    app.set_gateway(3, "mailin")
-    assert app.sync_published(3) == "removed"
-    assert app.total(3) == money("100.00")
-    assert len(app.fee_items(3)) == 0
+def test_production_published_unpaid_switch_from_stripealipay_to_mailin_removes_fee():
+    app = production_writer()
+    app.add_invoice(4, "100.00", "stripealipay", client_id=10)
+    assert app.sync_creation(4) == "added"
+    app.set_gateway(4, "mailin")
+    assert app.sync_published(4) == "removed"
+    assert app.total(4) == money("100.00")
+    assert len(app.fee_items(4)) == 0
 
 
 def test_published_unpaid_switch_between_stripe_gateways_does_not_duplicate_fee():
-    app = canary_writer()
-    app.add_invoice(3, "100.00", "stripe", client_id=10)
-    assert app.sync_creation(3) == "added"
-    first_item_id = app.fee_items(3)[0]["id"]
-    app.set_gateway(3, "stripealipay")
-    assert app.sync_published(3) == "gateway-updated"
-    assert app.total(3) == money("103.00")
-    assert len(app.fee_items(3)) == 1
-    assert app.fee_items(3)[0]["id"] == first_item_id
+    app = production_writer()
+    app.add_invoice(5, "100.00", "stripe", client_id=10)
+    assert app.sync_creation(5) == "added"
+    first_item_id = app.fee_items(5)[0]["id"]
+    app.set_gateway(5, "stripealipay")
+    assert app.sync_published(5) == "gateway-updated"
+    assert app.total(5) == money("103.00")
+    assert len(app.fee_items(5)) == 1
+    assert app.fee_items(5)[0]["id"] == first_item_id
 
 
-def test_paid_invoice_is_not_modified():
-    app = canary_writer()
-    app.add_invoice(4, "100.00", "stripe", status="Paid", client_id=10)
-    assert app.sync_creation(4) == "skipped"
-    assert app.total(4) == money("100.00")
-    app.set_status(4, "Unpaid")
-    assert app.sync_creation(4) == "added"
-    app.set_status(4, "Paid")
-    app.set_gateway(4, "banktransfer")
-    assert app.sync_published(4) == "skipped"
-    assert app.total(4) == money("103.00")
-    assert len(app.fee_items(4)) == 1
+def test_non_unpaid_statuses_are_not_modified():
+    for idx, status in enumerate(["Paid", "Cancelled", "Refunded", "Collections"], start=30):
+        app = production_writer()
+        app.add_invoice(idx, "100.00", "stripe", status=status, client_id=10)
+        assert app.sync_creation(idx) == "skipped"
+        assert app.sync_published(idx) == "skipped"
+        assert app.total(idx) == money("100.00")
+        assert len(app.fee_items(idx)) == 0
 
 
-def test_cancelled_invoice_is_not_modified():
-    app = canary_writer()
-    app.add_invoice(40, "100.00", "mailin", status="Cancelled", client_id=10)
-    app.set_gateway(40, "stripe")
+def test_paid_invoice_with_existing_fee_is_not_modified_after_gateway_change():
+    app = production_writer()
+    app.add_invoice(40, "100.00", "stripe", status="Unpaid", client_id=10)
+    assert app.sync_creation(40) == "added"
+    app.set_status(40, "Paid")
+    app.set_gateway(40, "banktransfer")
     assert app.sync_published(40) == "skipped"
-    assert app.total(40) == money("100.00")
-    assert len(app.fee_items(40)) == 0
+    assert app.total(40) == money("103.00")
+    assert len(app.fee_items(40)) == 1
 
 
 def test_base_excludes_existing_fee():
-    app = canary_writer()
-    app.add_invoice(5, "100.00", "stripe", client_id=10)
-    assert app.sync_creation(5) == "added"
-    active = app.active[5]
+    app = production_writer()
+    app.add_invoice(50, "100.00", "stripe", client_id=10)
+    assert app.sync_creation(50) == "added"
+    active = app.active[50]
     assert active["base_amount"] == money("100.00")
     assert active["fee_amount"] == money("3.00")
-    assert app.sync_creation(5) == "noop"
-    assert app.active[5]["base_amount"] == money("100.00")
+    assert app.sync_creation(50) == "noop"
+    assert app.active[50]["base_amount"] == money("100.00")
 
 
 def test_concurrent_repeat_sync_does_not_duplicate_active_fee():
-    app = canary_writer()
-    app.add_invoice(6, "100.00", "stripe", client_id=10)
+    app = production_writer()
+    app.add_invoice(60, "100.00", "stripe", client_id=10)
     results = []
-    threads = [Thread(target=lambda: results.append(app.sync_creation(6))) for _ in range(12)]
+    threads = [Thread(target=lambda: results.append(app.sync_creation(60))) for _ in range(12)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
     assert results.count("added") == 1
-    assert len(app.fee_items(6)) == 1
+    assert len(app.fee_items(60)) == 1
     assert len(app.active) == 1
 
 
 def test_fee_percent_is_configurable():
-    app = canary_writer(fee_percent="2.50")
-    app.add_invoice(7, "100.00", "stripe", client_id=10)
-    assert app.sync_creation(7) == "added"
-    assert app.total(7) == money("102.50")
-    assert app.active[7]["fee_amount"] == money("2.50")
+    app = production_writer(fee_percent="2.50")
+    app.add_invoice(70, "100.00", "stripe", client_id=10)
+    assert app.sync_creation(70) == "added"
+    assert app.total(70) == money("102.50")
+    assert app.active[70]["fee_amount"] == money("2.50")
 
 
 def test_invoice_creation_base_uses_line_items_not_unfinalized_total():
@@ -374,11 +443,11 @@ def test_invoice_creation_base_excludes_credit_and_paid_amounts():
         {"id": 1, "description": "service", "amount": "100.00"},
     ]
     assert invoice_items_base_amount(items, credit="20.00", paid="0.00") == money("80.00")
-    app = canary_writer()
-    app.add_invoice(8, "100.00", "stripe", credit="20.00", client_id=10)
-    assert app.sync_creation(8) == "added"
-    assert app.active[8]["base_amount"] == money("80.00")
-    assert app.active[8]["fee_amount"] == money("2.40")
+    app = production_writer()
+    app.add_invoice(80, "100.00", "stripe", credit="20.00", client_id=10)
+    assert app.sync_creation(80) == "added"
+    assert app.active[80]["base_amount"] == money("80.00")
+    assert app.active[80]["fee_amount"] == money("2.40")
 
 
 def test_preautomationtask_after_precronjob_is_not_globally_skipped():
@@ -393,73 +462,119 @@ def test_preautomationtask_after_precronjob_is_not_globally_skipped():
 
     seen.add(precron)
     assert capture not in seen
-    assert unknown_task == ""  # empty key means no dedupe, so WHMCS task still runs
+    assert unknown_task == ""
 
 
 def test_default_config_does_not_write_invoice():
     app = GatewayFeeScenario()
-    app.add_invoice(9, "100.00", "stripe")
-    assert app.sync_creation(9) == "module-disabled"
-    assert app.total(9) == money("100.00")
-    assert len(app.fee_items(9)) == 0
+    app.add_invoice(90, "100.00", "stripe")
+    assert app.sync_creation(90) == "module-disabled"
+    assert app.total(90) == money("100.00")
+    assert len(app.fee_items(90)) == 0
 
 
-def test_canary_disabled_does_not_write_invoice():
-    app = GatewayFeeScenario(enabled=True, canary_enabled=False)
-    app.add_invoice(10, "100.00", "stripe", client_id=20)
-    assert app.sync_creation(10) == "canary-disabled"
-    assert app.total(10) == money("100.00")
-    assert len(app.fee_items(10)) == 0
+def test_canary_mode_still_requires_invoice_and_client_allowlists():
+    app = GatewayFeeScenario(enabled=True, mode="canary", dry_run_only=False)
+    app.add_invoice(91, "100.00", "stripe", client_id=91)
+    assert app.sync_creation(91) == "canary-allowlist-required"
+    assert len(app.fee_items(91)) == 0
 
 
-def test_enabled_on_but_canary_disabled_does_not_write_invoice():
-    app = GatewayFeeScenario(enabled=True, canary_enabled=False, canary_dry_run_only=False, canary_invoice_ids=[11], canary_client_ids=[21])
-    app.add_invoice(11, "100.00", "stripe", client_id=21)
-    assert app.sync_creation(11) == "canary-disabled"
-    assert app.total(11) == money("100.00")
-    assert len(app.fee_items(11)) == 0
+def test_canary_mode_allows_only_exact_invoice_client_pair():
+    app = GatewayFeeScenario(
+        enabled=True,
+        mode="canary",
+        dry_run_only=False,
+        canary_invoice_ids=[92],
+        canary_client_ids=[920],
+    )
+    app.add_invoice(92, "100.00", "stripe", client_id=920)
+    app.add_invoice(93, "100.00", "stripe", client_id=920)
+    app.add_invoice(94, "100.00", "stripe", client_id=921)
+    assert app.sync_creation(92) == "added"
+    assert app.sync_creation(93) == "canary-not-allowlisted"
+    assert app.sync_creation(94) == "canary-not-allowlisted"
+    assert len(app.fee_items(92)) == 1
+    assert len(app.fee_items(93)) == 0
+    assert len(app.fee_items(94)) == 0
 
 
-def test_canary_dry_run_only_blocks_even_allowlisted_invoice_write():
-    app = GatewayFeeScenario(enabled=True, canary_enabled=True, canary_dry_run_only=True, canary_invoice_ids=[12], canary_client_ids=[22])
-    app.add_invoice(12, "100.00", "stripe", client_id=22)
-    assert app.sync_creation(12) == "canary-dry-run-only"
-    assert app.total(12) == money("100.00")
-    assert len(app.fee_items(12)) == 0
+def test_production_mode_automation_scans_only_unpaid_candidates_and_no_duplicates():
+    app = production_writer()
+    app.add_invoice(100, "100.00", "stripe", client_id=100)
+    app.add_invoice(101, "100.00", "stripe", status="Paid", client_id=101)
+    app.add_invoice(102, "100.00", "stripealipay", client_id=102)
+    app.add_invoice(103, "100.00", "stripe", client_id=103)
+    assert app.sync_creation(102) == "added"
+    assert app.sync_creation(103) == "added"
+    app.set_gateway(102, "mailin")
+
+    stats = app.sync_automation()
+    assert stats == {"scanned": 3, "synced": 3, "unsupported": 0, "blocked": 0, "errors": 0}
+    assert len(app.fee_items(100)) == 1
+    assert len(app.fee_items(101)) == 0
+    assert len(app.fee_items(102)) == 0
+    assert len(app.fee_items(103)) == 1
+    assert app.total(100) == money("103.00")
+    assert app.total(101) == money("100.00")
+    assert app.total(102) == money("100.00")
+    assert app.total(103) == money("103.00")
 
 
-def test_canary_requires_invoice_and_client_allowlists():
-    app = GatewayFeeScenario(enabled=True, canary_enabled=True, canary_dry_run_only=False, canary_invoice_ids=[13], canary_client_ids=[])
-    app.add_invoice(13, "100.00", "stripe", client_id=23)
-    assert app.sync_creation(13) == "canary-allowlist-required"
-    assert len(app.fee_items(13)) == 0
+def test_automation_batch_limit_is_respected():
+    app = GatewayFeeScenario(enabled=True, mode="production", dry_run_only=False, automation_limit=2)
+    for invoice_id in (110, 111, 112):
+        app.add_invoice(invoice_id, "100.00", "stripe", client_id=invoice_id)
+    stats = app.sync_automation()
+    assert stats["scanned"] == 2
+    assert len(app.fee_items(110)) == 1
+    assert len(app.fee_items(111)) == 1
+    assert len(app.fee_items(112)) == 0
 
 
-def test_canary_allows_only_exact_invoice_client_pair_when_dry_run_disabled():
-    app = GatewayFeeScenario(enabled=True, canary_enabled=True, canary_dry_run_only=False, canary_invoice_ids=[14], canary_client_ids=[24])
-    app.add_invoice(14, "100.00", "stripe", client_id=24)
-    app.add_invoice(15, "100.00", "stripe", client_id=24)
-    app.add_invoice(16, "100.00", "stripe", client_id=25)
-    assert app.sync_creation(14) == "added"
-    assert app.sync_creation(15) == "canary-not-allowlisted"
-    assert app.sync_creation(16) == "canary-not-allowlisted"
-    assert len(app.fee_items(14)) == 1
-    assert len(app.fee_items(15)) == 0
-    assert len(app.fee_items(16)) == 0
+def test_automation_is_blocked_outside_production_mode():
+    app = canary_writer()
+    app.add_invoice(120, "100.00", "stripe", client_id=120)
+    assert app.sync_automation() == {"scanned": 0, "synced": 0, "unsupported": 0, "blocked": 1, "errors": 0}
+    assert len(app.fee_items(120)) == 0
 
 
-def test_production_canary_build_always_blocks_automation_scans():
-    app = GatewayFeeScenario(enabled=True, canary_enabled=False)
-    app.add_invoice(17, "100.00", "stripe", client_id=27)
-    assert app.sync_automation() == {"blocked": 1, "scanned": 0}
+def test_dry_run_blocks_writes_in_canary_and_production_modes():
+    canary = GatewayFeeScenario(
+        enabled=True,
+        mode="canary",
+        dry_run_only=True,
+        canary_invoice_ids=[130],
+        canary_client_ids=[130],
+    )
+    canary.add_invoice(130, "100.00", "stripe", client_id=130)
+    assert canary.sync_creation(130) == "dry-run-only"
+    assert len(canary.fee_items(130)) == 0
+
+    production = GatewayFeeScenario(enabled=True, mode="production", dry_run_only=True)
+    production.add_invoice(131, "100.00", "stripe", client_id=131)
+    assert production.sync_creation(131) == "dry-run-only"
+    assert len(production.fee_items(131)) == 0
+
+    stats = production.sync_automation()
+    assert stats == {"scanned": 1, "synced": 0, "unsupported": 0, "blocked": 1, "errors": 0}
+    assert len(production.fee_items(131)) == 0
 
 
-def test_emergency_kill_switch_blocks_writes_and_automation():
-    app = GatewayFeeScenario(enabled=True, canary_enabled=True, canary_dry_run_only=False, canary_invoice_ids=[18], canary_client_ids=[28], emergency_kill_switch=True)
-    app.add_invoice(18, "100.00", "stripe", client_id=28)
-    assert app.sync_creation(18) == "emergency-killed"
-    assert app.sync_automation() == {"blocked": 1, "scanned": 0}
-    assert len(app.fee_items(18)) == 0
+def test_emergency_kill_switch_blocks_writes_and_automation_in_all_modes():
+    for mode in ("canary", "production"):
+        app = GatewayFeeScenario(
+            enabled=True,
+            mode=mode,
+            dry_run_only=False,
+            canary_invoice_ids=[140],
+            canary_client_ids=[140],
+            emergency_kill_switch=True,
+        )
+        app.add_invoice(140, "100.00", "stripe", client_id=140)
+        assert app.sync_creation(140) == "emergency-killed"
+        assert app.sync_automation() == {"scanned": 0, "synced": 0, "unsupported": 0, "blocked": 1, "errors": 0}
+        assert len(app.fee_items(140)) == 0
 
 
 def run():
@@ -467,11 +582,12 @@ def run():
         test_stripe_invoice_adds_one_fee,
         test_repeat_sync_does_not_duplicate_fee,
         test_stripealipay_adds_fee,
-        test_published_unpaid_switch_from_mailin_to_stripe_adds_fee,
-        test_published_unpaid_switch_from_stripealipay_to_mailin_removes_fee,
+        test_production_mode_does_not_require_allowlist,
+        test_production_published_unpaid_switch_from_mailin_to_stripe_adds_fee,
+        test_production_published_unpaid_switch_from_stripealipay_to_mailin_removes_fee,
         test_published_unpaid_switch_between_stripe_gateways_does_not_duplicate_fee,
-        test_paid_invoice_is_not_modified,
-        test_cancelled_invoice_is_not_modified,
+        test_non_unpaid_statuses_are_not_modified,
+        test_paid_invoice_with_existing_fee_is_not_modified_after_gateway_change,
         test_base_excludes_existing_fee,
         test_concurrent_repeat_sync_does_not_duplicate_active_fee,
         test_fee_percent_is_configurable,
@@ -479,13 +595,13 @@ def run():
         test_invoice_creation_base_excludes_credit_and_paid_amounts,
         test_preautomationtask_after_precronjob_is_not_globally_skipped,
         test_default_config_does_not_write_invoice,
-        test_canary_disabled_does_not_write_invoice,
-        test_enabled_on_but_canary_disabled_does_not_write_invoice,
-        test_canary_dry_run_only_blocks_even_allowlisted_invoice_write,
-        test_canary_requires_invoice_and_client_allowlists,
-        test_canary_allows_only_exact_invoice_client_pair_when_dry_run_disabled,
-        test_production_canary_build_always_blocks_automation_scans,
-        test_emergency_kill_switch_blocks_writes_and_automation,
+        test_canary_mode_still_requires_invoice_and_client_allowlists,
+        test_canary_mode_allows_only_exact_invoice_client_pair,
+        test_production_mode_automation_scans_only_unpaid_candidates_and_no_duplicates,
+        test_automation_batch_limit_is_respected,
+        test_automation_is_blocked_outside_production_mode,
+        test_dry_run_blocks_writes_in_canary_and_production_modes,
+        test_emergency_kill_switch_blocks_writes_and_automation_in_all_modes,
     ]
     for test in tests:
         test()

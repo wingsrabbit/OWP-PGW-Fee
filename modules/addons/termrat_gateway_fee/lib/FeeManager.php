@@ -28,12 +28,15 @@ class TermRatGatewayFeeManager
     {
         return array(
             'enabled' => false,
+            'mode' => 'canary',
+            'dry_run_only' => true,
             'fee_percent' => '3.00',
             'gateways' => array('stripe', 'stripealipay'),
             'fee_description_en' => 'Payment gateway processing fee ({percent}%)',
             'fee_description_zh' => '支付网关手续费（{percent}%）',
             'taxable' => false,
             'debug_log' => false,
+            // Legacy canary names are retained for existing saved WHMCS settings.
             'production_canary_enabled' => false,
             'production_canary_dry_run_only' => true,
             'production_canary_invoice_ids' => array(),
@@ -45,14 +48,21 @@ class TermRatGatewayFeeManager
     public static function normalizeConfig(array $input)
     {
         $defaults = self::defaults();
+        if (!array_key_exists('dry_run_only', $input) && array_key_exists('production_canary_dry_run_only', $input)) {
+            $input['dry_run_only'] = $input['production_canary_dry_run_only'];
+        }
+
         $config = array_merge($defaults, $input);
 
         $config['enabled'] = self::toBool($config['enabled']);
+        $config['mode'] = self::normalizeMode($config['mode']);
+        $config['dry_run_only'] = self::toBool($config['dry_run_only']);
         $config['taxable'] = self::toBool($config['taxable']);
         $config['debug_log'] = self::toBool($config['debug_log']);
         $config['production_canary_enabled'] = self::toBool($config['production_canary_enabled']);
         $config['production_canary_dry_run_only'] = self::toBool($config['production_canary_dry_run_only']);
         $config['emergency_kill_switch'] = self::toBool($config['emergency_kill_switch']);
+        $config['production_canary_dry_run_only'] = $config['dry_run_only'];
         $config['fee_percent'] = self::normalizePercent($config['fee_percent']);
 
         if (is_array($config['gateways'])) {
@@ -104,14 +114,14 @@ class TermRatGatewayFeeManager
     {
         return array(
             'enabled' => $this->config['enabled'] ? 'on' : 'off',
+            'mode' => $this->config['mode'],
+            'dry_run_only' => $this->config['dry_run_only'] ? 'on' : 'off',
             'fee_percent' => $this->config['fee_percent'],
             'gateways' => implode(',', $this->config['gateways']),
             'fee_description_en' => $this->config['fee_description_en'],
             'fee_description_zh' => $this->config['fee_description_zh'],
             'taxable' => $this->config['taxable'] ? 'on' : 'off',
             'debug_log' => $this->config['debug_log'] ? 'on' : 'off',
-            'production_canary_enabled' => $this->config['production_canary_enabled'] ? 'on' : 'off',
-            'production_canary_dry_run_only' => $this->config['production_canary_dry_run_only'] ? 'on' : 'off',
             'production_canary_invoice_ids' => implode(',', $this->config['production_canary_invoice_ids']),
             'production_canary_client_ids' => implode(',', $this->config['production_canary_client_ids']),
             'emergency_kill_switch' => $this->config['emergency_kill_switch'] ? 'on' : 'off',
@@ -176,9 +186,9 @@ class TermRatGatewayFeeManager
             $action = 'would-update-gateway';
         }
 
-        $canaryStatus = $this->canaryWriteStatus($snapshot, 'dry-run', 'inspect');
-        if (strpos($action, 'would-') === 0 && !$canaryStatus['allowed']) {
-            $action = $canaryStatus['action'];
+        $writeStatus = $this->writeStatus($snapshot, 'dry-run', 'inspect');
+        if (strpos($action, 'would-') === 0 && !$writeStatus['allowed']) {
+            $action = $writeStatus['action'];
         }
 
         return array(
@@ -189,7 +199,8 @@ class TermRatGatewayFeeManager
             'base_amount' => $baseAmount,
             'fee_percent' => $this->config['fee_percent'],
             'fee_amount' => $feeAmount,
-            'production_canary' => $canaryStatus['message'],
+            'mode' => $this->config['mode'],
+            'write_status' => $writeStatus['message'],
             'emergency_kill_switch' => $this->config['emergency_kill_switch'] ? 'on' : 'off',
             'message' => $this->explainApplicability($snapshot),
         );
@@ -197,7 +208,7 @@ class TermRatGatewayFeeManager
 
     public function syncAutomationInvoices($reason = 'automation')
     {
-        $stats = array('synced' => 0, 'unsupported' => 0, 'blocked' => 0, 'errors' => 0);
+        $stats = array('scanned' => 0, 'synced' => 0, 'unsupported' => 0, 'blocked' => 0, 'errors' => 0);
 
         if ($this->config['emergency_kill_switch']) {
             $stats['blocked']++;
@@ -206,8 +217,40 @@ class TermRatGatewayFeeManager
             return $stats;
         }
 
-        $stats['blocked']++;
-        $this->log('production-canary-automation-blocked', array('reason' => $reason), array('message' => 'Production canary test build forbids cron or automation batch invoice scans.'), true);
+        if (!$this->config['enabled']) {
+            $stats['blocked']++;
+            $this->log('automation-blocked', array('reason' => $reason), array('message' => 'Automation skipped because the module is disabled.'), true);
+
+            return $stats;
+        }
+
+        if ($this->config['mode'] !== 'production') {
+            $stats['blocked']++;
+            $this->log('automation-blocked', array('reason' => $reason, 'mode' => $this->config['mode']), array('message' => 'Automation batch scans are only enabled in production mode.'), true);
+
+            return $stats;
+        }
+
+        foreach ($this->findAutomationCandidateInvoiceIds() as $invoiceId) {
+            $stats['scanned']++;
+            try {
+                $result = $this->config['dry_run_only'] ? $this->dryRunInvoice($invoiceId) : $this->syncInvoice($invoiceId, $reason);
+                if ($result['action'] === 'noop' || $result['action'] === 'skipped') {
+                    $stats['synced']++;
+                } elseif (strpos($result['action'], 'would-') === 0 || strpos($result['action'], 'dry-run') !== false || strpos($result['action'], 'mode-') === 0) {
+                    $stats['blocked']++;
+                } elseif (strpos($result['action'], 'unsupported') === 0) {
+                    $stats['unsupported']++;
+                } else {
+                    $stats['synced']++;
+                }
+            } catch (Exception $e) {
+                $stats['errors']++;
+                $this->log('automation-error', array('invoice_id' => $invoiceId, 'reason' => $reason), array('error' => $e->getMessage()), true);
+            }
+        }
+
+        $this->debug('automation-summary', array('reason' => $reason, 'mode' => $this->config['mode']), $stats);
 
         return $stats;
     }
@@ -539,7 +582,7 @@ class TermRatGatewayFeeManager
             return $result;
         }
 
-        $status = $this->canaryWriteStatus($snapshot, $reason, $operation);
+        $status = $this->writeStatus($snapshot, $reason, $operation);
         if ($status['allowed']) {
             return null;
         }
@@ -551,28 +594,42 @@ class TermRatGatewayFeeManager
             'message' => $status['message'],
         ), $details);
 
-        $this->log('production-canary-write-blocked', $this->safeWriteLogContext($snapshot, $reason, $operation), $result, true);
+        $this->log('gateway-fee-write-blocked', $this->safeWriteLogContext($snapshot, $reason, $operation), $result, true);
 
         return $result;
     }
 
-    private function canaryWriteStatus(array $snapshot, $reason, $operation)
+    private function writeStatus(array $snapshot, $reason, $operation)
     {
         if (!$this->config['enabled']) {
             return array(
-                'enabled' => false,
                 'allowed' => false,
                 'action' => 'module-disabled',
                 'message' => 'Module is disabled; invoice writes are blocked.',
             );
         }
 
-        if (!$this->config['production_canary_enabled']) {
+        if ($this->config['dry_run_only']) {
             return array(
-                'enabled' => false,
                 'allowed' => false,
-                'action' => 'canary-disabled',
-                'message' => 'Production canary is disabled; invoice writes are blocked by default.',
+                'action' => 'dry-run-only',
+                'message' => 'Dry-run-only is on; invoice write was logged but not executed.',
+            );
+        }
+
+        if ($this->config['mode'] === 'production') {
+            return array(
+                'allowed' => true,
+                'action' => 'production-write-allowed',
+                'message' => 'Production mode write allowed.',
+            );
+        }
+
+        if ($this->config['mode'] !== 'canary') {
+            return array(
+                'allowed' => false,
+                'action' => 'invalid-mode',
+                'message' => 'Invalid mode; invoice writes are blocked.',
             );
         }
 
@@ -583,33 +640,21 @@ class TermRatGatewayFeeManager
 
         if (!$this->config['production_canary_invoice_ids'] || !$this->config['production_canary_client_ids']) {
             return array(
-                'enabled' => true,
                 'allowed' => false,
                 'action' => 'canary-allowlist-required',
-                'message' => 'Production canary requires both invoice_id and client_id allowlists before any write.',
+                'message' => 'Canary mode requires both invoice_id and client_id allowlists before any write.',
             );
         }
 
         if (!$invoiceAllowed || !$clientAllowed) {
             return array(
-                'enabled' => true,
                 'allowed' => false,
                 'action' => 'canary-not-allowlisted',
                 'message' => 'Invoice write blocked because the invoice_id/client_id pair is not allowlisted for production canary.',
             );
         }
 
-        if ($this->config['production_canary_dry_run_only']) {
-            return array(
-                'enabled' => true,
-                'allowed' => false,
-                'action' => 'canary-dry-run-only',
-                'message' => 'Production canary dry_run_only is on; invoice write was logged but not executed.',
-            );
-        }
-
         return array(
-            'enabled' => true,
             'allowed' => true,
             'action' => 'canary-write-allowed',
             'message' => 'Production canary write allowed for the configured invoice_id/client_id pair.',
@@ -811,13 +856,47 @@ class TermRatGatewayFeeManager
     private function findAutomationInvoiceIds()
     {
         $this->assertCapsule();
-        return array();
+
+        if (!$this->config['enabled'] || $this->config['mode'] !== 'production') {
+            return array();
+        }
+
+        $rows = Capsule::table('tblinvoices')
+            ->where('status', 'Unpaid')
+            ->whereIn('paymentmethod', $this->config['gateways'])
+            ->orderBy('id', 'asc')
+            ->limit(self::AUTOMATION_LIMIT)
+            ->get(array('id'));
+
+        return $this->pluckIds($rows);
     }
 
     private function findStaleActiveFeeInvoiceIds()
     {
         $this->assertCapsule();
-        return array();
+
+        if (!$this->config['enabled'] || $this->config['mode'] !== 'production') {
+            return array();
+        }
+
+        $rows = Capsule::table(self::TABLE . ' as fee')
+            ->leftJoin('tblinvoices as inv', 'inv.id', '=', 'fee.invoice_id')
+            ->where('fee.status', 'active')
+            ->where('inv.status', 'Unpaid')
+            ->whereNotIn('inv.paymentmethod', $this->config['gateways'])
+            ->orderBy('fee.invoice_id', 'asc')
+            ->limit(self::AUTOMATION_LIMIT)
+            ->get(array('fee.invoice_id'));
+
+        return $this->pluckIds($rows, 'invoice_id');
+    }
+
+    private function findAutomationCandidateInvoiceIds()
+    {
+        $ids = array_merge($this->findAutomationInvoiceIds(), $this->findStaleActiveFeeInvoiceIds());
+        $ids = array_values(array_unique(array_map('intval', $ids)));
+
+        return array_slice($ids, 0, self::AUTOMATION_LIMIT);
     }
 
     private function pluckIds($rows, $field = 'id')
@@ -1041,6 +1120,13 @@ class TermRatGatewayFeeManager
         }
 
         return array_keys($ids);
+    }
+
+    private static function normalizeMode($mode)
+    {
+        $mode = strtolower(trim((string) $mode));
+
+        return in_array($mode, array('canary', 'production'), true) ? $mode : 'canary';
     }
 
     private static function normalizePercent($percent)
