@@ -1,0 +1,15 @@
+# 更新日志 / Changelog
+
+本项目版本号按操作规模递增：大操作 +0.1、中型 +0.01、小型 +0.001。
+格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
+
+## [Unreleased]
+
+## [0.1.0] - 2026-06-30
+### 新增
+- 首版 `termrat_gateway_fee` WHMCS Addon Module。
+- 支持 `stripe` / `stripealipay` 网关自动添加 3% payment gateway processing fee。
+- 支持切换到非 Stripe 类网关时移除 fee line item，并保留自有审计表记录。
+- 支持 `InvoiceCreation`、`InvoiceCreated`、`InvoiceChangeGateway`、发票查看入口、`PreCronJob`、`PreAutomationTask` 等 hook 入口。
+- 后台页面显示配置、最近 50 条 fee 审计记录，并提供 dry-run / resync invoice 工具。
+- 增加 WHMCS-free 行为测试脚本和 PHP 场景测试脚本。

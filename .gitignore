@@ -1,0 +1,10 @@
+.DS_Store
+vendor/
+node_modules/
+.idea/
+.vscode/
+*.log
+*.zip
+coverage/
+__pycache__/
+*.pyc
