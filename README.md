@@ -3,6 +3,9 @@
 > 在 WHMCS invoice 创建阶段给指定 payment gateways 自动加 **payment gateway processing fee** 的 Addon Module。
 > 它不是 payment gateway module，不修改 Stripe 网关，不修改 WHMCS core；fee 会作为 WHMCS invoice item 明示在发票中。
 
+> **Status: blocked for the original automatic gateway-switch requirement.**
+> WHMCS 9.0 non-Draft invoices are immutable. Under that official boundary, and without editing WHMCS core/gateways or bypassing WHMCS with direct production DB writes, this draft PR does **not** provide a fully automatic way to add/remove fee line items after invoice publication. Do not deploy this PR as a complete solution.
+
 ![version](https://img.shields.io/badge/version-v0.1.0-blue)
 ![whmcs](https://img.shields.io/badge/WHMCS-9.0.4-2ea44f)
 ![php](https://img.shields.io/badge/PHP-8.3-777bb4)
@@ -14,6 +17,7 @@
 
 - [功能特性](#功能特性)
 - [工作机制](#工作机制)
+- [Blocker](#blocker)
 - [Hook 点](#hook-点)
 - [安装路径](#安装路径)
 - [WHMCS 后台启用](#whmcs-后台启用)
@@ -61,6 +65,41 @@
 | 创建 HK$100.00 invoice 且 payment method 是 `stripe` | `InvoiceCreation` 阶段新增 `Payment gateway processing fee (3%)`，金额 HK$3.00，invoice total 变 HK$103.00 |
 | 创建 HK$100.00 invoice 且已应用 HK$20.00 credit | fee base 为 HK$80.00，fee 为 HK$2.40 |
 | 已发布 invoice 后切换到 `mailin` / `banktransfer` / USDT 类网关 | 不自动删除 fee line item；module log 记录 `unsupported-immutable-remove`，需要人工重开/作废/调整 invoice |
+
+---
+
+## Blocker
+
+The original product requirement is:
+
+1. customer switches to `stripe` / `stripealipay` -> fee line item appears automatically;
+2. customer switches away -> fee line item disappears automatically;
+3. no manual intervention;
+4. fee is visible in WHMCS billing/invoice output;
+5. no WHMCS core edits, no Stripe gateway edits, no direct production DB writes.
+
+Under WHMCS 9.0.4 invoice immutability, this cannot be implemented as a supported post-publication invoice line-item mutation in this draft PR:
+
+| Option | Result |
+|--------|--------|
+| `UpdateInvoice` on a published `Unpaid` invoice | Not proven. Official WHMCS 9.0 docs say non-Draft invoices cannot add/remove items. The local WHMCS 9.0.4 package is ionCube encoded, so this repo cannot produce an equivalent local runtime proof. |
+| Auto cancel/reissue with `CreateInvoice` | Not safe for service/domain invoices because `CreateInvoice` creates standalone custom invoice items and does not preserve service/domain `type` / `relid` linkage needed for WHMCS provisioning and renewal semantics. |
+| Auto cancel/reissue with `GenInvoices` | Not proven as a generic gateway-switch solution; payment method selection, invoice grouping, emails, invoice number changes, and service/domain coverage require real WHMCS staging validation. |
+| Credit/debit notes | Officially compatible with immutable invoices, but no public WHMCS API is available in this repo to create arbitrary gateway-fee debit/credit notes, and notes are ledger adjustments rather than invoice line items. |
+| Direct `tblinvoiceitems` write | Technically could bypass immutability, but violates the no direct production DB write / no core-bypass boundary and the WHMCS 9.0 compliance model. |
+
+Possible replacement designs and risks:
+
+| Replacement design | Impact / risk |
+|--------------------|---------------|
+| Prove `UpdateInvoice` can mutate published `Unpaid` invoices in WHMCS 9.0.4 staging | Best user experience if true, but contradicts the documented immutable invoice model and must be proven on real staging before this PR can rely on it. |
+| Automatically cancel/void and regenerate invoice after gateway switch | Can keep fee as an invoice item, but changes invoice id/number, can resend emails, may disrupt payment links, and must preserve service/domain renewal/provisioning relationships. |
+| Use debit/credit notes for gateway fee adjustments | Fits the WHMCS 9.0 accounting model better, but the fee appears as a note/adjustment rather than the original invoice item and requires staging proof of the correct API/workflow. |
+
+Required next proof before this PR can satisfy the original requirement:
+
+- staging proof that `UpdateInvoice` can add/remove line items on published `Unpaid` invoices despite the WHMCS 9.0 docs; or
+- an approved, staging-verified automatic reissue/credit-debit-note design that preserves service/domain renewal and provisioning semantics without core/gateway edits or direct DB writes.
 
 ---
 

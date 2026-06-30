@@ -4,6 +4,9 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
 ## [Unreleased]
+### Blocked
+- The original requirement for fully automatic fee add/remove after customer gateway switching remains blocked under WHMCS 9.0.4 invoice immutability. This draft PR must not be treated as satisfying that requirement without staging proof of a supported mutation path or an approved automatic reissue / credit-debit-note design.
+
 ### 修复
 - 修复 automation hook 去重粒度：`PreCronJob` 不再屏蔽后续 `PreAutomationTask`，后者按 task key 去重，未知 task 不去重。
 - 修复 `InvoiceCreation` 阶段使用未最终化 invoice total/balance 的风险；创建阶段改为从当前 invoice line items 计算 base，等待 WHMCS hook 后重算 total。
