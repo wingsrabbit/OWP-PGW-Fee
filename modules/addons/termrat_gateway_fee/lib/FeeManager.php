@@ -174,7 +174,9 @@ class TermRatGatewayFeeManager
         $applicable = $this->isInvoiceApplicable($snapshot);
 
         $action = 'noop';
-        if (!$this->isInvoiceModifiable($snapshot)) {
+        if ($this->shouldRemoveFeeForAppliedCredit($snapshot, $activeFee, $baseAmount)) {
+            $action = 'would-remove';
+        } elseif (!$this->isInvoiceModifiable($snapshot)) {
             $action = 'skipped';
         } elseif (!$applicable && $activeFee) {
             $action = 'would-remove';
@@ -282,8 +284,17 @@ class TermRatGatewayFeeManager
 
     public static function calculateInvoiceItemsBaseAmount($items, $excludeInvoiceItemId = 0, $creditAmount = '0.00', $amountPaid = '0.00')
     {
+        $baseCents = self::amountToCents(self::calculateInvoiceItemsGrossAmount($items, $excludeInvoiceItemId));
+        $baseCents -= self::amountToCents($creditAmount);
+        $baseCents -= self::amountToCents($amountPaid);
+
+        return self::formatCents(max(0, $baseCents));
+    }
+
+    public static function calculateInvoiceItemsGrossAmount($items, $excludeInvoiceItemId = 0)
+    {
         $excludeInvoiceItemId = (int) $excludeInvoiceItemId;
-        $baseCents = 0;
+        $grossCents = 0;
 
         foreach ($items as $item) {
             $itemId = (int) self::readValue($item, 'id', 0);
@@ -291,13 +302,20 @@ class TermRatGatewayFeeManager
                 continue;
             }
 
-            $baseCents += self::amountToCents(self::readValue($item, 'amount', '0.00'));
+            $grossCents += self::amountToCents(self::readValue($item, 'amount', '0.00'));
         }
 
-        $baseCents -= self::amountToCents($creditAmount);
-        $baseCents -= self::amountToCents($amountPaid);
+        return self::formatCents(max(0, $grossCents));
+    }
 
-        return self::formatCents(max(0, $baseCents));
+    public static function capAppliedCreditToNonFeeAmount($items, $excludeInvoiceItemId, $creditAmount, $amountPaid = '0.00')
+    {
+        $maxCreditCents = self::amountToCents(self::calculateInvoiceItemsGrossAmount($items, $excludeInvoiceItemId));
+        $maxCreditCents -= self::amountToCents($amountPaid);
+        $maxCreditCents = max(0, $maxCreditCents);
+        $creditCents = max(0, self::amountToCents($creditAmount));
+
+        return self::formatCents(min($creditCents, $maxCreditCents));
     }
 
     public static function amountToCents($amount)
@@ -447,22 +465,31 @@ class TermRatGatewayFeeManager
         );
     }
 
-    private function removeFee($activeFee, array $snapshot, $reason)
+    private function removeFee($activeFee, array $snapshot, $reason, $creditAmount = null)
     {
         $invoiceId = (int) $activeFee->invoice_id;
         $invoiceItemId = (int) $activeFee->invoice_item_id;
-        $writeGuard = $this->guardInvoiceWrite($snapshot, $reason, 'remove', array(
+        $guardDetails = array(
             'invoice_item_id' => $invoiceItemId,
-        ));
+        );
+        if ($creditAmount !== null) {
+            $guardDetails['credit'] = $creditAmount;
+        }
+
+        $writeGuard = $this->guardInvoiceWrite($snapshot, $reason, 'remove', $guardDetails);
         if ($writeGuard !== null) {
             return $writeGuard;
         }
 
+        $request = array('invoiceid' => $invoiceId);
         if ($invoiceItemId > 0 && $this->invoiceItemExists($invoiceItemId)) {
-            $request = array(
-                'invoiceid' => $invoiceId,
-                'deletelineids' => array($invoiceItemId),
-            );
+            $request['deletelineids'] = array($invoiceItemId);
+        }
+        if ($creditAmount !== null) {
+            $request['credit'] = $creditAmount;
+        }
+
+        if (isset($request['deletelineids']) || $creditAmount !== null) {
             $apiResult = $this->callApi('UpdateInvoice', $request);
             $this->assertApiSuccess('UpdateInvoice:remove', $apiResult);
         }
@@ -476,24 +503,23 @@ class TermRatGatewayFeeManager
             ));
 
         $this->recalculateInvoice($invoiceId);
-        $this->log('fee-removed', array('invoice_id' => $invoiceId, 'reason' => $reason), array('gateway' => $snapshot['paymentmethod'], 'invoice_item_id' => $invoiceItemId), true);
+        $response = array('gateway' => $snapshot['paymentmethod'], 'invoice_item_id' => $invoiceItemId);
+        if ($creditAmount !== null) {
+            $response['credit'] = $creditAmount;
+        }
+        $this->log('fee-removed', array('invoice_id' => $invoiceId, 'reason' => $reason), $response, true);
 
-        return array('action' => 'removed', 'invoice_id' => $invoiceId, 'invoice_item_id' => $invoiceItemId);
+        $result = array('action' => 'removed', 'invoice_id' => $invoiceId, 'invoice_item_id' => $invoiceItemId);
+        if ($creditAmount !== null) {
+            $result['credit'] = $creditAmount;
+        }
+
+        return $result;
     }
 
     private function calculateBaseAmount(array $snapshot, $activeFee)
     {
-        $baseCents = self::amountToCents($snapshot['balance']);
-
-        if ($activeFee) {
-            $feeItemAmount = $this->findInvoiceItemAmount($snapshot['items'], (int) $activeFee->invoice_item_id);
-            if ($feeItemAmount === null) {
-                $feeItemAmount = $activeFee->fee_amount;
-            }
-            $baseCents -= self::amountToCents($feeItemAmount);
-        }
-
-        return self::formatCents(max(0, $baseCents));
+        return $this->calculateBaseAmountFromItems($snapshot, $activeFee);
     }
 
     private function calculateBaseAmountFromItems(array $snapshot, $activeFee)
@@ -505,6 +531,13 @@ class TermRatGatewayFeeManager
 
     private function inspectPublishedInvoice(array $snapshot, $activeFee, $reason)
     {
+        $baseAmount = $this->calculateBaseAmount($snapshot, $activeFee);
+        $feeAmount = self::calculateFeeAmount($baseAmount, $this->config['fee_percent']);
+
+        if ($this->shouldRemoveFeeForAppliedCredit($snapshot, $activeFee, $baseAmount)) {
+            return $this->removeFee($activeFee, $snapshot, $reason . ':applied-credit-remove', $this->creditAmountWithoutFeeOverage($snapshot, $activeFee));
+        }
+
         if (!$this->isInvoiceModifiable($snapshot)) {
             $this->debug('skip', array('invoice_id' => $snapshot['id'], 'reason' => $reason), array('message' => $this->explainApplicability($snapshot)));
 
@@ -512,15 +545,13 @@ class TermRatGatewayFeeManager
         }
 
         $applicable = $this->isInvoiceApplicable($snapshot);
-        $baseAmount = $this->calculateBaseAmount($snapshot, $activeFee);
-        $feeAmount = self::calculateFeeAmount($baseAmount, $this->config['fee_percent']);
 
         if (!$applicable && !$activeFee) {
             return array('action' => 'skipped', 'message' => $this->explainApplicability($snapshot));
         }
 
         if (!$applicable && $activeFee) {
-            return $this->removeFee($activeFee, $snapshot, $reason . ':published-gateway-remove');
+            return $this->removeFee($activeFee, $snapshot, $reason . ':published-gateway-remove', $this->creditAmountWithoutFeeOverage($snapshot, $activeFee));
         }
 
         if (!$activeFee && self::amountToCents($feeAmount) > 0) {
@@ -528,7 +559,7 @@ class TermRatGatewayFeeManager
         }
 
         if ($activeFee && $this->activeFeeNeedsInvoiceRefresh($activeFee, $baseAmount, $feeAmount)) {
-            $removeResult = $this->removeFee($activeFee, $snapshot, $reason . ':published-gateway-refresh-remove');
+            $removeResult = $this->removeFee($activeFee, $snapshot, $reason . ':published-gateway-refresh-remove', $this->creditAmountWithoutFeeOverage($snapshot, $activeFee));
             if ($removeResult['action'] !== 'removed') {
                 return $removeResult;
             }
@@ -538,7 +569,13 @@ class TermRatGatewayFeeManager
             $feeAmount = self::calculateFeeAmount($baseAmount, $this->config['fee_percent']);
 
             if (self::amountToCents($feeAmount) <= 0) {
-                return array('action' => 'skipped', 'message' => 'Calculated published-stage fee is zero.');
+                return array(
+                    'action' => 'removed',
+                    'invoice_id' => (int) $snapshot['id'],
+                    'base_amount' => $baseAmount,
+                    'fee_amount' => $feeAmount,
+                    'message' => 'Calculated published-stage fee is zero after applied credit.',
+                );
             }
 
             return $this->addFee($snapshot, $baseAmount, $feeAmount, $reason . ':published-gateway-refresh-add');
@@ -670,6 +707,47 @@ class TermRatGatewayFeeManager
             'operation' => $operation,
             'gateway' => $snapshot['paymentmethod'],
         );
+    }
+
+    private function shouldRemoveFeeForAppliedCredit(array $snapshot, $activeFee, $baseAmount)
+    {
+        if (!$activeFee) {
+            return false;
+        }
+
+        if (!in_array(strtolower((string) $snapshot['status']), array('unpaid', 'paid'), true)) {
+            return false;
+        }
+
+        if (self::amountToCents($snapshot['credit']) <= 0) {
+            return false;
+        }
+
+        if (self::amountToCents($snapshot['amount_paid']) !== 0) {
+            return false;
+        }
+
+        return self::amountToCents($baseAmount) <= 0;
+    }
+
+    private function creditAmountWithoutFeeOverage(array $snapshot, $activeFee)
+    {
+        if (!$activeFee) {
+            return null;
+        }
+
+        $creditAmount = self::capAppliedCreditToNonFeeAmount(
+            $snapshot['items'],
+            (int) $activeFee->invoice_item_id,
+            $snapshot['credit'],
+            $snapshot['amount_paid']
+        );
+
+        if (self::amountToCents($creditAmount) < self::amountToCents($snapshot['credit'])) {
+            return $creditAmount;
+        }
+
+        return null;
     }
 
     private function activeFeeNeedsRefresh($activeFee, array $snapshot, $baseAmount, $feeAmount)

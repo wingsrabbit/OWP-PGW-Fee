@@ -172,6 +172,10 @@ add_hook('InvoiceChangeGateway', 1, function ($vars) {
     termrat_gateway_fee_hook_sync_invoice($vars, 'InvoiceChangeGateway');
 });
 
+add_hook('InvoicePaidPreEmail', 1, function ($vars) {
+    termrat_gateway_fee_hook_sync_invoice($vars, 'InvoicePaidPreEmail');
+});
+
 add_hook('ViewInvoiceDetailsPage', 1, function ($vars) {
     termrat_gateway_fee_hook_sync_invoice($vars, 'ViewInvoiceDetailsPage');
 });

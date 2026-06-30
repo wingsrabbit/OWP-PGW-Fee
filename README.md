@@ -40,7 +40,8 @@
 |------|------|
 | 网关范围 | 默认支持 `stripe`、`stripealipay`，可在 addon 配置中调整 |
 | 费用规则 | `base = invoice 当前应付金额 - 本模块已加 fee`；`fee = round(base * fee_percent / 100, 2)` |
-| 发票状态 | 只处理 `Unpaid` invoice；`Paid` / `Cancelled` / `Refunded` / `Collections` 等状态不修改 |
+| WHMCS credit | 只有已经 apply 到 invoice 的 credit 才减少 fee base；仅 client credit balance 可用但未 apply 时仍正常收费 |
+| 发票状态 | 常规同步只处理 `Unpaid` invoice；`Cancelled` / `Refunded` / `Collections` 不修改；`Paid` 仅允许 credit-only Apply Credit 移除本模块 fee 的修复路径 |
 | Gateway switch | `mailin` / 非 Stripe -> `stripe` / `stripealipay` 自动 add fee；切走自动 remove 本模块 fee；Stripe 类之间切换不重复收费 |
 | 防重复 | 自有审计表 `active_invoice_id` 唯一索引 + invoice 级 MySQL `GET_LOCK` |
 | 明示收费 | fee 作为 `tblinvoiceitems` line item 展示在 WHMCS invoice 内 |
@@ -96,15 +97,19 @@ emergency_kill_switch=off
 3. 如果 payment method 命中配置网关，且运行模式允许写入，模块通过 WHMCS `UpdateInvoice` Local API 新增 fee line item。
 4. WHMCS 在 `InvoiceCreation` hook 后重新计算 invoice totals，因此首封 invoice email 和客户看到的 invoice 应包含 fee。
 5. `InvoiceChangeGateway` / invoice view / admin check 对 published `Unpaid` invoice 执行同一同步逻辑：非 Stripe -> Stripe 类 add fee，Stripe 类 -> 非 Stripe remove fee，Stripe 类之间只更新审计 gateway。
-6. `PreCronJob` / `PreAutomationTask` 在 production mode 中执行安全候选扫描，覆盖保存卡/自动扣款前没有人打开 invoice 页面的问题。
-7. 自有表只做审计和幂等控制；如果刷新 fee，旧记录标记为 `removed`，新记录标记为 `active`。
+6. Apply Credit 后，fee base 只按仍需外部 payment gateway 收取的非 fee 金额计算；如果 credit 完全覆盖非 fee 金额，模块会移除本模块 fee。
+7. 如果客户先选择 Stripe 产生 fee，再 Apply Credit 到包含 fee 的 invoice，模块会在同步时通过 `UpdateInvoice` 同时 remove fee，并把 invoice credit cap 到非 fee 金额，避免 credit 支付手续费。
+8. `PreCronJob` / `PreAutomationTask` 在 production mode 中执行安全候选扫描，覆盖保存卡/自动扣款前没有人打开 invoice 页面的问题。
+9. 自有表只做审计和幂等控制；如果刷新 fee，旧记录标记为 `removed`，新记录标记为 `active`。
 
 示例：
 
 | 场景 | 结果 |
 |------|------|
 | HK$100.00 `stripe` invoice | 新增 `Payment gateway processing fee (3%)`，金额 HK$3.00，invoice total 变 HK$103.00 |
-| HK$100.00 invoice 已应用 HK$20.00 credit | fee base 为 HK$80.00，fee 为 HK$2.40 |
+| HK$100.00 invoice 有可用 credit 但未 apply | fee base 仍为 HK$100.00，fee 为 HK$3.00 |
+| HK$100.00 invoice 已 apply HK$40.00 credit | fee base 为 HK$60.00，fee 为 HK$1.80 |
+| HK$100.00 invoice 已 apply HK$100.00 credit | 不新增 fee；如已有本模块 active fee，会移除 fee |
 | published `Unpaid` invoice 从 `mailin` 切到 `stripe` | 自动新增 fee line item |
 | published `Unpaid` invoice 从 `stripealipay` 切到 `mailin` | 自动删除本模块 fee line item，invoice total 回到 base |
 | published `Unpaid` invoice 从 `stripe` 切到 `stripealipay` | 不新增第二条 fee，只更新审计 gateway |
@@ -120,6 +125,7 @@ emergency_kill_switch=off
 | `InvoiceCreation` | 创建阶段同步 fee，目标是让初始 invoice total/email 已包含 fee |
 | `InvoiceCreated` | 创建后补偿同步 |
 | `InvoiceChangeGateway` | published `Unpaid` gateway switch 主路径，自动 add/remove fee |
+| `InvoicePaidPreEmail` | credit-only Apply Credit 直接把带 fee invoice 标记 Paid 时，先尝试移除本模块 fee 再发 paid email |
 | `ViewInvoiceDetailsPage` | 后台/查看 invoice 时补偿同步 |
 | `ClientAreaPageViewInvoice` | 客户区发票查看入口补偿同步 |
 | `PreCronJob` | production mode 批量同步候选 `Unpaid` invoices |
@@ -307,22 +313,29 @@ Python 行为测试覆盖：
 | 5 | production mode 下 published `Unpaid` 从 `mailin` 切到 `stripe` 自动 add fee |
 | 6 | production mode 下 published `Unpaid` 从 `stripealipay` 切到 `mailin` 自动 remove fee |
 | 7 | `stripe` / `stripealipay` 之间切换不重复收费 |
-| 8 | `Paid` / `Cancelled` / `Refunded` / `Collections` 不修改 |
+| 8 | 非 credit-only 修复路径的 `Paid` / `Cancelled` / `Refunded` / `Collections` 不修改 |
 | 9 | 已有 fee 的 `Paid` invoice 切走 gateway 后不修改 |
-| 10 | base amount 不包含已有 fee |
-| 11 | 并发/重复触发不会产生两条 active fee |
-| 12 | fee percent 可配置 |
-| 13 | `InvoiceCreation` 阶段 base 使用 line items，不依赖未最终化 total |
-| 14 | `InvoiceCreation` 阶段 base 扣除 invoice credit / 已入账金额 |
-| 15 | `PreCronJob` 后触发 `PreAutomationTask` 不会被全局 static 无条件跳过 |
-| 16 | 默认 config 下不写入 |
-| 17 | canary mode 仍要求 invoice/client allowlist |
-| 18 | canary mode 只允许精确 invoice/client pair 写入 |
-| 19 | production automation 只扫 `Unpaid` 候选，并且不重复 fee |
-| 20 | automation batch limit 生效 |
-| 21 | canary mode 阻断 automation 批量扫描 |
-| 22 | dry-run 在 canary/production mode 都阻断写入 |
-| 23 | emergency kill switch 在 canary/production mode 都阻断写入和 automation |
+| 10 | `Cancelled` invoice 即使有 credit 和 active fee 也不修改 |
+| 11 | base amount 不包含已有 fee |
+| 12 | 并发/重复触发不会产生两条 active fee |
+| 13 | fee percent 可配置 |
+| 14 | `InvoiceCreation` 阶段 base 使用 line items，不依赖未最终化 total |
+| 15 | `InvoiceCreation` 阶段 base 扣除 invoice credit / 已入账金额 |
+| 16 | full applied credit 创建阶段不新增 fee |
+| 17 | 仅有可用 credit 但未 apply 时仍正常收费 |
+| 18 | 先有 fee 后 partial Apply Credit，会按剩余外部收款金额刷新 fee |
+| 19 | 先有 fee 后 full Apply Credit，会移除 fee，credit 不覆盖手续费 |
+| 20 | Apply Credit 已把含 fee invoice 标记 Paid 时，会 cap credit 并移除 fee |
+| 21 | Apply Credit refresh/remove 仍受 dry-run 和 kill switch 阻断 |
+| 22 | `PreCronJob` 后触发 `PreAutomationTask` 不会被全局 static 无条件跳过 |
+| 23 | 默认 config 下不写入 |
+| 24 | canary mode 仍要求 invoice/client allowlist |
+| 25 | canary mode 只允许精确 invoice/client pair 写入 |
+| 26 | production automation 只扫 `Unpaid` 候选，并且不重复 fee |
+| 27 | automation batch limit 生效 |
+| 28 | canary mode 阻断 automation 批量扫描 |
+| 29 | dry-run 在 canary/production mode 都阻断写入 |
+| 30 | emergency kill switch 在 canary/production mode 都阻断写入和 automation |
 
 WHMCS 9.0.4 staging / canary 验收建议：
 
@@ -331,7 +344,8 @@ WHMCS 9.0.4 staging / canary 验收建议：
 3. 同一测试 invoice 从 `mailin` 切到 `stripe`，确认 published `Unpaid` 自动 add fee。
 4. 同一测试 invoice 从 `stripealipay` 切到 `mailin`，确认 published `Unpaid` 自动 remove fee。
 5. 切 `stripe` <-> `stripealipay`，确认不重复收费。
-6. 切到 production mode 前先 `dry_run_only=on` 观察 automation log，再关闭 dry-run。
+6. 先选择 `stripe` 产生 fee，再点击 Apply Credit；partial credit 应降低 fee，full credit 应移除 fee，credit 不应覆盖手续费。
+7. 切到 production mode 前先 `dry_run_only=on` 观察 automation log，再关闭 dry-run。
 
 ---
 
@@ -403,6 +417,7 @@ TermRat-Gateway-Fee/
 - [WHMCS Addon Module hooks.php](https://developers.whmcs.com/addon-modules/hooks/)
 - [WHMCS Invoice Hooks](https://developers.whmcs.com/hooks-reference/invoices-and-quotes/)
 - [WHMCS Cron Hooks](https://developers.whmcs.com/hooks-reference/cron/)
+- [WHMCS ApplyCredit API](https://developers.whmcs.com/api-reference/applycredit/)
 - [WHMCS UpdateInvoice API](https://developers.whmcs.com/api-reference/updateinvoice/)
 - [WHMCS 9.0 Release Notes: Invoice Immutability](https://docs.whmcs.com/releases/9-0/9-0-release-notes/)
 - [WHMCS 9.0 Invoice Management](https://docs.whmcs.com/9-0/billing-and-invoicing/invoice-management/)

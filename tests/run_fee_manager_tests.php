@@ -35,6 +35,22 @@ tgf_assert_same(
     'creation-stage base excludes existing fee line item'
 );
 tgf_assert_same(
+    '103.00',
+    TermRatGatewayFeeManager::calculateInvoiceItemsGrossAmount(array(
+        array('id' => 1, 'amount' => '100.00'),
+        array('id' => 2, 'amount' => '3.00'),
+    )),
+    'gross amount includes fee when not excluded'
+);
+tgf_assert_same(
+    '100.00',
+    TermRatGatewayFeeManager::calculateInvoiceItemsGrossAmount(array(
+        array('id' => 1, 'amount' => '100.00'),
+        array('id' => 2, 'amount' => '3.00'),
+    ), 2),
+    'gross amount excludes active fee when requested'
+);
+tgf_assert_same(
     '80.00',
     TermRatGatewayFeeManager::calculateInvoiceItemsBaseAmount(array(
         array('id' => 1, 'amount' => '100.00'),
@@ -47,6 +63,46 @@ tgf_assert_same(
         array('id' => 1, 'amount' => '10.00'),
     ), 0, '20.00', '0.00'),
     'creation-stage base floors credit overpayment at zero'
+);
+tgf_assert_same(
+    '60.00',
+    TermRatGatewayFeeManager::calculateInvoiceItemsBaseAmount(array(
+        array('id' => 1, 'amount' => '100.00'),
+        array('id' => 2, 'amount' => '3.00'),
+    ), 2, '40.00', '0.00'),
+    'applied credit reduces fee base to remaining external non-fee amount'
+);
+tgf_assert_same(
+    '100.00',
+    TermRatGatewayFeeManager::calculateInvoiceItemsBaseAmount(array(
+        array('id' => 1, 'amount' => '100.00'),
+        array('id' => 2, 'amount' => '3.00'),
+    ), 2, '0.00', '0.00'),
+    'available but unapplied credit does not reduce fee base'
+);
+tgf_assert_same(
+    '0.00',
+    TermRatGatewayFeeManager::calculateInvoiceItemsBaseAmount(array(
+        array('id' => 1, 'amount' => '100.00'),
+        array('id' => 2, 'amount' => '3.00'),
+    ), 2, '100.00', '0.00'),
+    'full applied credit reduces fee base to zero'
+);
+tgf_assert_same(
+    '100.00',
+    TermRatGatewayFeeManager::capAppliedCreditToNonFeeAmount(array(
+        array('id' => 1, 'amount' => '100.00'),
+        array('id' => 2, 'amount' => '3.00'),
+    ), 2, '103.00', '0.00'),
+    'applied credit is capped so it cannot cover the gateway fee item'
+);
+tgf_assert_same(
+    '40.00',
+    TermRatGatewayFeeManager::capAppliedCreditToNonFeeAmount(array(
+        array('id' => 1, 'amount' => '100.00'),
+        array('id' => 2, 'amount' => '3.00'),
+    ), 2, '40.00', '0.00'),
+    'partial applied credit below non-fee amount is unchanged'
 );
 
 $defaultConfig = TermRatGatewayFeeManager::normalizeConfig(array());

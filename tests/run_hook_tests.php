@@ -32,4 +32,10 @@ tgf_hook_assert_same('credit-card-charges', $captureContext['task_key'], 'task n
 tgf_hook_assert_same('PreAutomationTask:credit-card-charges', termrat_gateway_fee_hook_automation_run_key('PreAutomationTask', $captureContext), 'pre-automation dedupes by task');
 tgf_hook_assert_same('', termrat_gateway_fee_hook_automation_run_key('PreAutomationTask', $unknownTaskContext), 'unknown automation task is not deduped');
 
+$hookNames = array();
+foreach ($registeredHooks as $registeredHook) {
+    $hookNames[] = $registeredHook[0];
+}
+tgf_hook_assert_same(true, in_array('InvoicePaidPreEmail', $hookNames, true), 'invoice paid pre-email hook is registered for credit-only Apply Credit cleanup');
+
 echo "ok - PHP hook context tests passed\n";

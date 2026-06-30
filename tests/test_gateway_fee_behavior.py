@@ -18,6 +18,16 @@ def invoice_items_base_amount(items, exclude_item_id=0, credit="0.00", paid="0.0
     return max(money(total), money("0.00"))
 
 
+def cap_credit_to_non_fee_amount(items, exclude_item_id=0, credit="0.00", paid="0.00"):
+    gross = Decimal("0.00")
+    for item in items:
+        if exclude_item_id and item["id"] == exclude_item_id:
+            continue
+        gross += money(item["amount"])
+    max_credit = max(money(gross) - money(paid), money("0.00"))
+    return min(money(credit), max_credit)
+
+
 def automation_run_key(reason, task_name=""):
     if reason == "PreCronJob":
         return "PreCronJob"
@@ -75,6 +85,16 @@ class GatewayFeeScenario:
     def total(self, invoice_id):
         return money(sum(item["amount"] for item in self.invoices[invoice_id]["items"]))
 
+    def balance(self, invoice_id):
+        invoice = self.invoices[invoice_id]
+        return max(self.total(invoice_id) - invoice["credit"] - invoice["paid"], money("0.00"))
+
+    def apply_credit(self, invoice_id, amount):
+        invoice = self.invoices[invoice_id]
+        invoice["credit"] += money(amount)
+        if self.balance(invoice_id) <= money("0.00"):
+            invoice["status"] = "Paid"
+
     def fee_items(self, invoice_id):
         return [
             item
@@ -101,6 +121,28 @@ class GatewayFeeScenario:
             return "canary-not-allowlisted"
         return "allowed"
 
+    def base_amount(self, invoice_id, active=None):
+        invoice = self.invoices[invoice_id]
+        exclude_item_id = active["invoice_item_id"] if active else 0
+        return invoice_items_base_amount(
+            invoice["items"],
+            exclude_item_id=exclude_item_id,
+            credit=invoice["credit"],
+            paid=invoice["paid"],
+        )
+
+    def should_remove_fee_for_applied_credit(self, invoice_id, active, base):
+        if not active:
+            return False
+        invoice = self.invoices[invoice_id]
+        if invoice["status"] not in ("Unpaid", "Paid"):
+            return False
+        if invoice["credit"] <= money("0.00"):
+            return False
+        if invoice["paid"] != money("0.00"):
+            return False
+        return base <= money("0.00")
+
     def sync_creation(self, invoice_id):
         with self.lock:
             guard = self.write_status(invoice_id)
@@ -115,12 +157,7 @@ class GatewayFeeScenario:
             if invoice["gateway"] not in self.gateways:
                 return "skipped"
 
-            base = invoice_items_base_amount(
-                invoice["items"],
-                exclude_item_id=active["invoice_item_id"] if active else 0,
-                credit=invoice["credit"],
-                paid=invoice["paid"],
-            )
+            base = self.base_amount(invoice_id, active)
             fee = money(base * self.fee_percent / Decimal("100"))
             if active:
                 if active["base_amount"] == base and active["fee_amount"] == fee and active["fee_percent"] == self.fee_percent:
@@ -141,6 +178,15 @@ class GatewayFeeScenario:
         with self.lock:
             invoice = self.invoices[invoice_id]
             active = self.active.get(invoice_id)
+            base = self.base_amount(invoice_id, active)
+
+            if self.should_remove_fee_for_applied_credit(invoice_id, active, base):
+                guard = self.write_status(invoice_id)
+                if guard != "allowed":
+                    return guard
+                self._remove_active_fee(invoice_id, cap_credit=True)
+                return "removed"
+
             if invoice["status"] != "Unpaid":
                 return "skipped"
 
@@ -152,12 +198,11 @@ class GatewayFeeScenario:
             if not applicable and active:
                 if guard != "allowed":
                     return guard
-                self._remove_active_fee(invoice_id)
+                self._remove_active_fee(invoice_id, cap_credit=True)
                 return "removed"
 
+            fee = money(base * self.fee_percent / Decimal("100"))
             if applicable and not active:
-                base = invoice_items_base_amount(invoice["items"], credit=invoice["credit"], paid=invoice["paid"])
-                fee = money(base * self.fee_percent / Decimal("100"))
                 if fee <= money("0.00"):
                     return "skipped"
                 if guard != "allowed":
@@ -165,19 +210,12 @@ class GatewayFeeScenario:
                 self._add_fee(invoice_id, base, fee)
                 return "added"
 
-            base = invoice_items_base_amount(
-                invoice["items"],
-                exclude_item_id=active["invoice_item_id"],
-                credit=invoice["credit"],
-                paid=invoice["paid"],
-            )
-            fee = money(base * self.fee_percent / Decimal("100"))
             if active["base_amount"] != base or active["fee_amount"] != fee or active["fee_percent"] != self.fee_percent:
                 if guard != "allowed":
                     return guard
-                self._remove_active_fee(invoice_id)
+                self._remove_active_fee(invoice_id, cap_credit=True)
                 if fee <= money("0.00"):
-                    return "skipped"
+                    return "removed"
                 self._add_fee(invoice_id, base, fee)
                 return "refreshed"
 
@@ -192,31 +230,29 @@ class GatewayFeeScenario:
     def dry_run_invoice(self, invoice_id):
         invoice = self.invoices[invoice_id]
         active = self.active.get(invoice_id)
-        if invoice["status"] != "Unpaid":
-            return "skipped"
-        applicable = invoice["gateway"] in self.gateways
-        if not applicable and active:
+        base = self.base_amount(invoice_id, active)
+
+        if self.should_remove_fee_for_applied_credit(invoice_id, active, base):
             action = "would-remove"
-        elif applicable and not active:
-            base = invoice_items_base_amount(invoice["items"], credit=invoice["credit"], paid=invoice["paid"])
-            fee = money(base * self.fee_percent / Decimal("100"))
-            action = "would-add" if fee > money("0.00") else "skipped"
-        elif applicable and active:
-            base = invoice_items_base_amount(
-                invoice["items"],
-                exclude_item_id=active["invoice_item_id"],
-                credit=invoice["credit"],
-                paid=invoice["paid"],
-            )
-            fee = money(base * self.fee_percent / Decimal("100"))
-            if active["base_amount"] != base or active["fee_amount"] != fee or active["fee_percent"] != self.fee_percent:
-                action = "would-refresh"
-            elif active["gateway"] != invoice["gateway"]:
-                action = "would-update-gateway"
-            else:
-                action = "noop"
+        elif invoice["status"] != "Unpaid":
+            return "skipped"
         else:
-            action = "skipped"
+            applicable = invoice["gateway"] in self.gateways
+            if not applicable and active:
+                action = "would-remove"
+            elif applicable and not active:
+                fee = money(base * self.fee_percent / Decimal("100"))
+                action = "would-add" if fee > money("0.00") else "skipped"
+            elif applicable and active:
+                fee = money(base * self.fee_percent / Decimal("100"))
+                if active["base_amount"] != base or active["fee_amount"] != fee or active["fee_percent"] != self.fee_percent:
+                    action = "would-refresh"
+                elif active["gateway"] != invoice["gateway"]:
+                    action = "would-update-gateway"
+                else:
+                    action = "noop"
+            else:
+                action = "skipped"
 
         if action.startswith("would-"):
             guard = self.write_status(invoice_id)
@@ -283,9 +319,16 @@ class GatewayFeeScenario:
         self.active[invoice_id] = record
         self.audit.append(record)
 
-    def _remove_active_fee(self, invoice_id):
+    def _remove_active_fee(self, invoice_id, cap_credit=False):
         active = self.active[invoice_id]
         invoice = self.invoices[invoice_id]
+        if cap_credit:
+            invoice["credit"] = cap_credit_to_non_fee_amount(
+                invoice["items"],
+                exclude_item_id=active["invoice_item_id"],
+                credit=invoice["credit"],
+                paid=invoice["paid"],
+            )
         invoice["items"] = [item for item in invoice["items"] if item["id"] != active["invoice_item_id"]]
         active["status"] = "removed"
         del self.active[invoice_id]
@@ -395,6 +438,17 @@ def test_paid_invoice_with_existing_fee_is_not_modified_after_gateway_change():
     assert len(app.fee_items(40)) == 1
 
 
+def test_cancelled_invoice_with_credit_and_existing_fee_is_not_modified():
+    app = production_writer()
+    app.add_invoice(41, "100.00", "stripe", status="Unpaid", client_id=10)
+    assert app.sync_creation(41) == "added"
+    app.invoices[41]["credit"] = money("103.00")
+    app.set_status(41, "Cancelled")
+    assert app.sync_published(41) == "skipped"
+    assert app.total(41) == money("103.00")
+    assert len(app.fee_items(41)) == 1
+
+
 def test_base_excludes_existing_fee():
     app = production_writer()
     app.add_invoice(50, "100.00", "stripe", client_id=10)
@@ -448,6 +502,79 @@ def test_invoice_creation_base_excludes_credit_and_paid_amounts():
     assert app.sync_creation(80) == "added"
     assert app.active[80]["base_amount"] == money("80.00")
     assert app.active[80]["fee_amount"] == money("2.40")
+
+
+def test_full_credit_at_creation_skips_gateway_fee():
+    app = production_writer()
+    app.add_invoice(81, "100.00", "stripe", credit="100.00", client_id=10)
+    assert app.sync_creation(81) == "skipped"
+    assert app.total(81) == money("100.00")
+    assert len(app.fee_items(81)) == 0
+
+
+def test_available_credit_not_applied_still_charges_fee():
+    app = production_writer()
+    app.add_invoice(82, "100.00", "stripe", credit="0.00", client_id=10)
+    assert app.sync_creation(82) == "added"
+    assert app.active[82]["base_amount"] == money("100.00")
+    assert app.active[82]["fee_amount"] == money("3.00")
+
+
+def test_partial_apply_credit_after_fee_refreshes_fee_on_remaining_external_base():
+    app = production_writer()
+    app.add_invoice(83, "100.00", "stripe", client_id=10)
+    assert app.sync_creation(83) == "added"
+    app.apply_credit(83, "40.00")
+    assert app.sync_published(83) == "refreshed"
+    assert app.active[83]["base_amount"] == money("60.00")
+    assert app.active[83]["fee_amount"] == money("1.80")
+    assert app.total(83) == money("101.80")
+    assert app.balance(83) == money("61.80")
+    assert len(app.fee_items(83)) == 1
+
+
+def test_full_apply_credit_after_fee_removes_fee_before_credit_pays_fee():
+    app = production_writer()
+    app.add_invoice(84, "100.00", "stripe", client_id=10)
+    assert app.sync_creation(84) == "added"
+    app.apply_credit(84, "100.00")
+    assert app.sync_published(84) == "removed"
+    assert app.total(84) == money("100.00")
+    assert app.invoices[84]["credit"] == money("100.00")
+    assert app.balance(84) == money("0.00")
+    assert len(app.fee_items(84)) == 0
+
+
+def test_over_apply_credit_after_fee_caps_credit_and_removes_paid_credit_fee():
+    app = production_writer()
+    app.add_invoice(85, "100.00", "stripe", client_id=10)
+    assert app.sync_creation(85) == "added"
+    app.apply_credit(85, "103.00")
+    assert app.invoices[85]["status"] == "Paid"
+    assert app.sync_published(85) == "removed"
+    assert app.total(85) == money("100.00")
+    assert app.invoices[85]["credit"] == money("100.00")
+    assert len(app.fee_items(85)) == 0
+
+
+def test_credit_refresh_dry_run_and_kill_switch_do_not_write():
+    dry_run = production_writer()
+    dry_run.add_invoice(86, "100.00", "stripe", client_id=10)
+    assert dry_run.sync_creation(86) == "added"
+    dry_run.dry_run_only = True
+    dry_run.apply_credit(86, "40.00")
+    assert dry_run.sync_published(86) == "dry-run-only"
+    assert dry_run.active[86]["fee_amount"] == money("3.00")
+    assert dry_run.total(86) == money("103.00")
+
+    killed = production_writer()
+    killed.add_invoice(87, "100.00", "stripe", client_id=10)
+    assert killed.sync_creation(87) == "added"
+    killed.emergency_kill_switch = True
+    killed.apply_credit(87, "100.00")
+    assert killed.sync_published(87) == "emergency-killed"
+    assert killed.total(87) == money("103.00")
+    assert len(killed.fee_items(87)) == 1
 
 
 def test_preautomationtask_after_precronjob_is_not_globally_skipped():
@@ -588,11 +715,18 @@ def run():
         test_published_unpaid_switch_between_stripe_gateways_does_not_duplicate_fee,
         test_non_unpaid_statuses_are_not_modified,
         test_paid_invoice_with_existing_fee_is_not_modified_after_gateway_change,
+        test_cancelled_invoice_with_credit_and_existing_fee_is_not_modified,
         test_base_excludes_existing_fee,
         test_concurrent_repeat_sync_does_not_duplicate_active_fee,
         test_fee_percent_is_configurable,
         test_invoice_creation_base_uses_line_items_not_unfinalized_total,
         test_invoice_creation_base_excludes_credit_and_paid_amounts,
+        test_full_credit_at_creation_skips_gateway_fee,
+        test_available_credit_not_applied_still_charges_fee,
+        test_partial_apply_credit_after_fee_refreshes_fee_on_remaining_external_base,
+        test_full_apply_credit_after_fee_removes_fee_before_credit_pays_fee,
+        test_over_apply_credit_after_fee_caps_credit_and_removes_paid_credit_fee,
+        test_credit_refresh_dry_run_and_kill_switch_do_not_write,
         test_preautomationtask_after_precronjob_is_not_globally_skipped,
         test_default_config_does_not_write_invoice,
         test_canary_mode_still_requires_invoice_and_client_allowlists,
